@@ -12,7 +12,7 @@ The first milestone focuses on creating a reliable end-to-end framework using a 
 
 # Phase 0 — Project Scoping
 
-**Status:** Completed ✅
+**Status:** Completed
 
 ## Objectives
 
@@ -44,7 +44,7 @@ The goal is to establish a strong foundation before optimization.
 
 # Phase 1 — Project & Environment Setup
 
-**Status:** In Progress
+**Status:** Completed
 
 ## Objectives
 
@@ -72,6 +72,8 @@ Create a clean and reproducible development environment.
 ---
 
 # Phase 2 — Data Acquisition & Storage
+
+**Status:** In Progress
 
 ## Objectives
 
