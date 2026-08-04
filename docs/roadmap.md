@@ -1,44 +1,83 @@
-# EEG Digit Classification — Development Roadmap
+# EEG Digit Classification Roadmap
 
-## Project Timeline
+## Project Goal
 
-**Target timeline:** 1–2 months
+Develop an end-to-end EEG classification pipeline using the **MindBigData2023 MNIST-2B** dataset.
 
-**Initial milestone:** Build a complete working EEG classification pipeline within 2 weeks.
+The project will follow a hierarchical classification approach:
 
-The first milestone focuses on creating a reliable end-to-end framework using a smaller dataset subset. Future iterations will scale the dataset size, improve preprocessing, and explore more advanced models.
+### Stage 1 — Stimulus Detection
+
+**Binary classification**
+
+* Blank/rest EEG (`label = -1`)
+* Digit stimulus EEG (`label = 0–9`)
+
+**Goal**
+
+Determine whether EEG contains detectable information about visual stimulus presence.
+
+### Stage 2 — Digit Decoding
+
+**Multi-class classification**
+
+* Digit classes: `0–9`
+
+**Goal**
+
+Determine whether EEG responses contain enough information to identify the presented digit.
+
+The initial milestone is to build a **clean, reproducible end-to-end pipeline** with honest baseline results. Model performance optimization will come later.
 
 ---
 
-# Phase 0 — Project Scoping
+# Phase 0 — Scoping Decisions
 
 **Status:** Completed
 
-## Objectives
+## Dataset Selection
 
-Define the initial scope of the project before implementation.
+**Dataset:** MindBigData2023 MNIST-2B
 
-## Decisions
+* Hugging Face version
+* Initial development on a **10–20% stratified subset**
+* Scale to the complete dataset after validating the pipeline
 
-### Dataset
+## Classification Strategy
 
-* Dataset: MindBigData 2023 — MNIST-2B
-* Source: Hugging Face
-* Initial experiment size: 10–20% stratified subset
-* Future plan: Scale to larger/full dataset
+Rather than directly attempting 10-class digit classification, the project will progress through two stages.
 
-### Success Criteria
+### Stage 1 — Binary Classification
 
-The first milestone is not based on achieving a fixed accuracy target.
+**Task**
+
+* Blank (`-1`) vs Digit (`0–9`)
+
+**Goal**
+
+Determine whether EEG contains sufficient information to detect the presence of a visual stimulus.
+
+### Stage 2 — Multi-class Classification
+
+**Task**
+
+* Digit (`0–9`)
+
+**Goal**
+
+Determine whether EEG contains enough information to identify which digit was presented.
+
+## Success Criteria
+
+The objective is **not** achieving a fixed accuracy target.
 
 Success means:
 
-* Complete data pipeline
+* Working end-to-end pipeline
 * Reproducible experiments
 * Honest baseline performance
-* Working evaluation pipeline
-
-The goal is to establish a strong foundation before optimization.
+* Clean and modular codebase
+* Easily extensible architecture
 
 ---
 
@@ -46,28 +85,59 @@ The goal is to establish a strong foundation before optimization.
 
 **Status:** Completed
 
-## Objectives
+## Repository Structure
 
-Create a clean and reproducible development environment.
+```text
+eeg-digit-classification/
 
-## Tasks
+├── configs/
+├── data/
+│   ├── raw/
+│   ├── interim/
+│   └── processed/
+│
+├── docs/
+├── models/
+├── notebooks/
+├── results/
+│
+├── src/
+│   ├── data/
+│   ├── features/
+│   ├── models/
+│   ├── training/
+│   ├── evaluation/
+│   └── utils/
+│
+├── README.md
+├── roadmap.md
+├── requirements.txt
+├── .gitignore
+└── LICENSE
+```
 
-* Create Git repository
-* Define project structure
-* Configure `.gitignore`
-* Create Python environment
-* Create `requirements.txt`
-* Create documentation structure
-* Decide development workflow:
+## Development Workflow
 
-  * Local development
-  * Colab/GPU training
+### Development
 
-## Deliverables
+* VS Code
+* Python virtual environment
+* Git & GitHub
 
-* Working repository
-* Reproducible environment
-* Initial documentation
+### Training
+
+* Local CPU for development and debugging
+* Google Colab GPU for deep learning experiments
+
+## Experiment Tracking
+
+### Initial
+
+* Local CSV/log-based experiment tracking
+
+### Future
+
+* Integrate Weights & Biases after establishing baseline models
 
 ---
 
@@ -77,327 +147,317 @@ Create a clean and reproducible development environment.
 
 ## Objectives
 
-Understand, acquire, validate, and organize the EEG dataset.
+Understand the dataset completely before writing preprocessing or training code.
 
-## Tasks
+## Dataset Structure
 
-### Dataset Exploration
+Each row represents **one EEG trial**.
 
-* Inspect Hugging Face dataset structure
-* Understand:
+### EEG Data
 
-  * Number of trials
-  * EEG channels
-  * Sampling frequency
-  * Epoch length
-  * Labels
-  * Metadata
-
-### Data Download
-
-* Download selected subset
-* Store original files in:
+* 128 EEG channels
+* 500 samples per channel
+* 250 Hz sampling rate
+* 2-second recording
 
 ```
-data/raw/
+128 × 500 = 64,000 EEG values
 ```
 
-### Data Processing
+### Labels
 
-Convert raw dataset into efficient machine learning format:
+* `-1` → Blank screen
+* `0–9` → Presented digit
 
+Additional label information:
+
+* `label_source`
+* `label_pos`
+* `label_imgpix_0` ... `label_imgpix_783`
+
+### Metadata
+
+* `timestamp`
+* `sessionnum`
+* `blocknum`
+* `blockpos`
+
+## Data Validation
+
+Perform sanity checks:
+
+* Verify channel count
+* Verify sample count per channel
+* Check missing values
+* Check corrupt trials
+* Check duplicate trials
+* Verify class distribution
+* Measure blank (`-1`) distribution
+* Verify session distribution
+* Confirm consistent channel ordering
+
+### Questions
+
+* What is the exact file size after conversion?
+* Are there any incomplete or corrupted trials?
+* Are there any irregular trial lengths?
+* Is channel ordering identical across every trial?
+
+## Data Conversion
+
+Convert the Hugging Face dataset into an ML-ready format.
+
+Target representation:
+
+```text
+X
+
+(number_of_trials,
+128 channels,
+500 samples)
 ```
-data/processed/
+
+```text
+y
+
+(number_of_trials,)
 ```
 
-Preferred format:
+Store metadata separately.
+
+Preferred storage format:
 
 * HDF5
-
-Alternative:
-
-* NPZ
-
-### Validation Checks
-
-Verify:
-
-* Class distribution
-* Missing values
-* Corrupted trials
-* Sample length consistency
-* Sampling frequency consistency
-
-### Decisions
-
-Document:
-
-* Padding/truncation strategy
-* Data normalization strategy
-* Storage format
-
-## Deliverables
-
-* Clean processed dataset
-* Data validation report
-* Dataset loading script
 
 ---
 
 # Phase 3 — Leakage-Safe Dataset Splitting
 
+**Status:** Not Started
+
 ## Objectives
 
-Create reliable train, validation, and test datasets.
+Create reproducible train/validation/test datasets while preventing information leakage.
 
-## Tasks
+## Dataset Splitting
 
-* Define split strategy
-* Perform trial-level splitting
-* Prevent window-level leakage
-* Stratify by digit labels
-* Create reproducible random seeds
+* Trial-level split (never window-level)
+* Train / Validation / Test
+* Stratified sampling
+* Fixed random seed
 
-## Initial Split
+### Stage 1
 
-Potential starting point:
+Blank (`-1`) vs Digit (`0–9`)
 
-* Training: 70%
-* Validation: 15%
-* Testing: 15%
+### Stage 2
 
-Final split may change after dataset inspection.
+Digits only (`0–9`)
 
-## Additional Validation
+## Leakage Prevention
 
-Implement:
+Investigate different splitting strategies:
 
-* Label permutation test
-* Random baseline comparison
+* Random trial split
+* Session-aware split
+* Chronological split
 
-## Deliverables
+Use metadata:
 
-* Train/validation/test datasets
-* Split generation script
-* Leakage checks
+* `sessionnum`
+* `blocknum`
+* `timestamp`
+
+## Validation
+
+Implement a permutation-test baseline (shuffled labels) before training any real models.
 
 ---
 
 # Phase 4 — EEG Preprocessing Pipeline
 
+**Status:** Not Started
+
 ## Objectives
 
-Create reusable EEG preprocessing pipelines.
+Develop a reusable preprocessing pipeline.
 
 ## Signal Processing
-
-Initial preprocessing:
 
 * Bandpass filtering
 * Notch filtering
-* Basic artifact handling
+* Signal normalization
+* Basic artifact detection
 
-Advanced methods for later:
+## Feature Paths
 
-* ICA
-* Automated artifact rejection
+### Path A — Classical Machine Learning
 
-## Two Processing Paths
+Extract features such as:
 
-### Classical ML Path
-
-Extract:
-
-* Band power features
+* Band power
 * Statistical features
 * Frequency-domain features
 
-### Deep Learning Path
+### Path B — Deep Learning
 
-Use:
+Use filtered raw EEG directly.
 
-* Filtered raw EEG signals
-
-## Configuration
-
-Make preprocessing parameters configurable:
-
-Example:
+Input format:
 
 ```
-configs/preprocessing.yaml
+(channels, time)
 ```
 
-Parameters:
-
-* Frequency bands
-* Filter settings
-* Artifact thresholds
-
-## Deliverables
-
-* Preprocessing pipeline
-* Feature extraction pipeline
-* Visualization notebooks
+The preprocessing pipeline should be configurable for future experiments.
 
 ---
 
-# Phase 5 — Classical Machine Learning Baselines
+# Phase 5 — Baseline Models
 
-## Objectives
+**Status:** Not Started
 
-Establish baseline performance before deep learning.
+## Stage 1 — Binary Classification
 
-## Models
+### Task
 
-Implement:
+Blank (`-1`) vs Digit (`0–9`)
 
-* Linear Discriminant Analysis
-* Support Vector Machine
+### Models
+
+* Linear Discriminant Analysis (LDA)
+* Support Vector Machine (SVM)
 * Random Forest
 
-## Evaluation
+### Evaluation
 
-Metrics:
+* Accuracy
+* Precision
+* Recall
+* F1-score
+* Confusion Matrix
+
+### Goal
+
+Verify that EEG signals contain detectable information about visual stimulus presence.
+
+---
+
+## Stage 2 — Multi-class Classification
+
+### Task
+
+Digit (`0–9`)
+
+### Models
+
+* Linear Discriminant Analysis (LDA)
+* Support Vector Machine (SVM)
+* Random Forest
+
+### Evaluation
 
 * Accuracy
 * Macro F1-score
-* Confusion matrix
-* Per-digit performance
-
-Compare against:
-
-* Random classifier
-* Permutation baseline
-
-## Deliverables
-
-* Baseline results
-* Evaluation framework
+* Per-digit confusion matrix
+* Permutation baseline comparison
 
 ---
 
-# Phase 6 — Deep Learning Pipeline
+# Phase 6 — Deep Learning Models
 
-## Objectives
-
-Train EEG-specific deep learning models.
+**Status:** Not Started
 
 ## Primary Model
 
-EEGNet-style CNN
+**EEGNet**
 
-Reasons:
+Train separate models for:
 
-* Designed for EEG
-* Lightweight
-* Strong baseline
-* Suitable for limited datasets
+* Binary stimulus detection
+* Multi-class digit classification
 
-## Additional Experiments
-
-Possible comparisons:
+## Optional Models
 
 * 1D CNN
 * LSTM
-* Transformer-based models (future)
 
-## Training Pipeline
+Track:
 
-Implement:
-
-* Training loop
-* Validation loop
-* Checkpoint saving
-* Learning rate scheduling
-* Early stopping
-
-## Deliverables
-
-* Deep learning baseline
-* Saved model checkpoints
-* Training curves
+* Training loss
+* Validation loss
+* Accuracy
+* Learning curves
+* Saved checkpoints
 
 ---
 
-# Phase 7 — Evaluation & 2-Week Milestone
+# Phase 7 — Evaluation & Analysis
 
-## Objectives
+**Status:** Not Started
 
-Analyze results and document progress.
+## Binary Classification
 
-## Evaluation
+Evaluate:
 
-Report:
+* Accuracy
+* Precision
+* Recall
+* F1-score
+* Confusion Matrix
+* ROC-AUC (optional)
 
-* Test accuracy
+Research Question:
+
+> Can EEG reliably distinguish between blank and visual stimulus trials?
+
+---
+
+## Multi-class Classification
+
+Evaluate:
+
+* Accuracy
 * Macro F1-score
-* Confusion matrix
-* Digit-level performance
+* Per-digit confusion matrix
 
-## Error Analysis
+Analyze:
 
-Investigate:
+* Most confused digit pairs
+* Failure cases
+* Error distribution
 
-* Commonly confused digits
-* Subject/session effects
-* Signal quality issues
+Research Question:
 
-## Documentation
+> Which digits are most distinguishable from EEG, and which are consistently confused?
 
-Update:
+---
 
-* README
+## Two-Week Milestone
+
+Deliverables:
+
+* Complete preprocessing pipeline
+* ML-ready dataset
+* Leakage-safe data split
+* Baseline classical ML models
+* Initial EEGNet implementation
+* Reproducible experiments
 * Results notebook
-* Experiment notes
-
-## Deliverable
-
-A complete working EEG classification framework.
+* Initial findings report
 
 ---
 
-# Future Improvements
+# Future Extensions
 
-After the initial milestone:
+Potential research directions:
 
-## Dataset
-
-* Increase dataset size
-* Explore full MindBigData dataset
-* Evaluate generalization
-
-## Signal Processing
-
-* Advanced artifact removal
-* ICA
-* Better normalization strategies
-
-## Modeling
-
-* Hyperparameter optimization
-* Larger architectures
-* Transfer learning
-* Pretrained EEG models
-
-## Engineering
-
-* Experiment tracking
-* Automated pipelines
-* Model deployment experiments
-
----
-
-# Current Progress
-
-| Phase                    | Status         |
-| ------------------------ | -------------- |
-| Phase 0 — Scoping        | ✅ Complete     |
-| Phase 1 — Setup          | 🚧 In Progress |
-| Phase 2 — Data Pipeline  | ⬜ Not Started  |
-| Phase 3 — Data Splitting | ⬜ Not Started  |
-| Phase 4 — Preprocessing  | ⬜ Not Started  |
-| Phase 5 — ML Baselines   | ⬜ Not Started  |
-| Phase 6 — Deep Learning  | ⬜ Not Started  |
-| Phase 7 — Evaluation     | ⬜ Not Started  |
+* Advanced artifact removal (ICA)
+* Transfer learning with pretrained EEG models
+* Cross-session generalization
+* Cross-subject evaluation
+* Transformer-based architectures
+* Self-supervised representation learning
+* Real-time EEG decoding
+* Brain–Computer Interface (BCI) applications
 
