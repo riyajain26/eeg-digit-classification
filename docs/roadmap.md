@@ -31,6 +31,50 @@ The initial milestone is to build a **clean, reproducible end-to-end pipeline** 
 
 ---
 
+## Scope Note: Stage 1 First, Stage 2 Incremental
+
+This project builds Stage 1 (binary: blank vs. digit) completely first,
+including a working baseline and deep learning model, before starting
+Stage 2 (digit 0-9).
+
+Stage 2 is **not a separate track** — it reuses Stage 1's trained backbone
+(feature-reuse design) and repeats several of the same pipeline steps on
+digit-only data:
+
+| Step                          | Stage 1 status | Stage 2 status |
+|--------------------------------|----------------|----------------|
+| Data acquisition & storage     | Done           | Done (same files, filtered by `label_digit != -1`) |
+| Leakage-safe splitting         | Done           | Done (same split, digit-only subset) |
+| Permutation-test harness       | Done           | Deferred — needs stratified sampling |
+| Preprocessing pipeline         | In progress    | Deferred |
+| Baseline models (Phase 5)      | Not started    | Deferred |
+| Deep learning model (Phase 6)  | Not started    | Deferred — depends on Stage 1's trained backbone |
+| Evaluation (Phase 7)           | Not started    | Deferred |
+
+Rule of thumb: any phase marked "Deferred" for Stage 2 gets revisited only
+after the same phase is complete for Stage 1.
+
+## Scope Note: Dataset Scale-Up Plan
+
+Data volume scales independently of the Stage 1/2 axis above, in three
+planned steps:
+
+1. **Current**: ~20% stratified subsample of **MindBigData2023 MNIST-2B**
+   (the reduced Hugging Face release) — used to validate the full pipeline
+   end-to-end cheaply before committing to larger runs.
+2. **Next**: scale to **100% of MNIST-2B** — once the pipeline (data prep,
+   splitting, preprocessing, baseline models) is proven correct on the
+   subsample, re-run against the full 2B release.
+3. **Final**: scale to **100% of the original MindBigData2023 MNIST-8B**
+   dataset — the full, un-reduced release — once the pipeline has been
+   validated at the 2B scale.
+
+Rule of thumb: don't scale up until the current scale's results (and
+leakage/permutation checks) look correct and trustworthy. Chasing bigger
+data on top of an unverified pipeline just means bigger, slower mistakes.
+
+---
+
 # Phase 0 — Scoping Decisions
 
 **Status:** Completed
@@ -223,7 +267,7 @@ full file into memory, plus built-in per-chunk compression).
 
 # Phase 3 — Leakage-Safe Dataset Splitting
 
-**Status:** Not Started
+**Status:** Completed
 
 ## Objectives
 
