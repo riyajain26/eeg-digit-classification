@@ -316,7 +316,7 @@ Implement a permutation-test baseline (shuffled labels) before training any real
 
 # Phase 4 — EEG Preprocessing Pipeline
 
-**Status:** Not Started
+**Status:** In Progress
 
 ## Objectives
 
