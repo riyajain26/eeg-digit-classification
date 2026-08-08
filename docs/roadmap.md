@@ -223,7 +223,7 @@ full file into memory, plus built-in per-chunk compression).
 
 # Phase 3 — Leakage-Safe Dataset Splitting
 
-**Status:** Not Started
+**Status:** In Progress
 
 ## Objectives
 
