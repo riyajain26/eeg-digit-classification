@@ -143,7 +143,7 @@ eeg-digit-classification/
 
 # Phase 2 — Data Acquisition & Storage
 
-**Status:** In Progress
+**Status:** Completed
 
 ## Objectives
 
@@ -156,9 +156,9 @@ Each row represents **one EEG trial**.
 ### EEG Data
 
 * 128 EEG channels
-* 500 samples per channel
+* 256 samples per channel
 * 250 Hz sampling rate
-* 2-second recording
+* ~1-second recording
 
 ```
 128 × 500 = 64,000 EEG values
@@ -184,50 +184,40 @@ Additional label information:
 
 ## Data Validation
 
-Perform sanity checks:
+Completed in Notebook 02, Sections 4 & 6:
 
-* Verify channel count
-* Verify sample count per channel
-* Check missing values
-* Check corrupt trials
-* Check duplicate trials
-* Verify class distribution
-* Measure blank (`-1`) distribution
-* Verify session distribution
-* Confirm consistent channel ordering
+* Verified EEG array shape consistency
+* Checked for NaN/corrupt values
+* Verified binary and digit-class distribution
+* Confirmed metadata present on every trial
 
-### Questions
-
-* What is the exact file size after conversion?
-* Are there any incomplete or corrupted trials?
-* Are there any irregular trial lengths?
-* Is channel ordering identical across every trial?
+(Deferred to Phase 3: session distribution and channel-ordering-across-trials
+checks, since they're more naturally part of split validation.)
 
 ## Data Conversion
 
-Convert the Hugging Face dataset into an ML-ready format.
+Converted via Hugging Face streaming (no full download) into array-based HDF5
+— not per-trial groups, to avoid HDF5 metadata overhead at scale.
 
 Target representation:
 
-```text
-X
-
-(number_of_trials,
-128 channels,
-500 samples)
+```
+eeg (N, 128, 256) float32
+label_binary (N,) 0=blank, 1=digit
+label_digit (N,) -1=blank, 0-9=digit
 ```
 
-```text
-y
+metadata arrays (sessionnum, blocknum, blockpos, timestamp), shape (N,) each
 
-(number_of_trials,)
+**Two separate files produced:**
+
+```
+data/processed/mindbigdata2023_train.h5 # train/val pool (~28,000 trials target)
+data/processed/mindbigdata2023_test.h5 # held-out test set (~6,000 trials target)
 ```
 
-Store metadata separately.
-
-Preferred storage format:
-
-* HDF5
+Storage format: HDF5 (chosen for partial/indexed reads without loading the
+full file into memory, plus built-in per-chunk compression).
 
 ---
 
@@ -239,24 +229,30 @@ Preferred storage format:
 
 Create reproducible train/validation/test datasets while preventing information leakage.
 
+## Test Set Sanity Check (new — first step)
+
+Before splitting, verify Hugging Face's official train/test boundary is
+itself leakage-safe: check for `sessionnum` overlap between
+`mindbigdata2023_train.h5` and `mindbigdata2023_test.h5`. If clean, adopt
+their test set as final and only split train/val ourselves. If overlap is
+found, fall back to deriving a custom 3-way split.
+
 ## Dataset Splitting
 
-* Trial-level split (never window-level)
-* Train / Validation / Test
+* Trial-level split (never window-level) — applies to the train/val boundary
+  only, since test is (pending the check above) already separated
 * Stratified sampling
 * Fixed random seed
 
 ### Stage 1
-
 Blank (`-1`) vs Digit (`0–9`)
 
 ### Stage 2
-
 Digits only (`0–9`)
 
 ## Leakage Prevention
 
-Investigate different splitting strategies:
+Investigate different splitting strategies for train/val:
 
 * Random trial split
 * Session-aware split
