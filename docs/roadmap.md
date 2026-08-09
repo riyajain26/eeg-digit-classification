@@ -355,7 +355,7 @@ The preprocessing pipeline should be configurable for future experiments.
 
 # Phase 5 — Baseline Models
 
-**Status:** Not Started
+**Status:** In Progress
 
 ## Stage 1 — Binary Classification
 
