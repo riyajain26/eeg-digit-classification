@@ -77,7 +77,7 @@ data on top of an unverified pipeline just means bigger, slower mistakes.
 
 # Phase 0 — Scoping Decisions
 
-**Status:** Completed
+**Status:** Completed (S1, reduced 2B)
 
 ## Dataset Selection
 
@@ -127,7 +127,7 @@ Success means:
 
 # Phase 1 — Project & Environment Setup
 
-**Status:** Completed
+**Status:** Completed (S1, reduced 2B)
 
 ## Repository Structure
 
@@ -187,7 +187,7 @@ eeg-digit-classification/
 
 # Phase 2 — Data Acquisition & Storage
 
-**Status:** Completed
+**Status:** Completed (S1, reduced 2B)
 
 ## Objectives
 
@@ -267,7 +267,7 @@ full file into memory, plus built-in per-chunk compression).
 
 # Phase 3 — Leakage-Safe Dataset Splitting
 
-**Status:** Completed
+**Status:** Completed (S1, reduced 2B)
 
 ## Objectives
 
@@ -316,7 +316,7 @@ Implement a permutation-test baseline (shuffled labels) before training any real
 
 # Phase 4 — EEG Preprocessing Pipeline
 
-**Status:** In Progress
+**Status:** Completed (S1, reduced 2B)
 
 ## Objectives
 
