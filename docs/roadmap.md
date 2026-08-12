@@ -355,7 +355,7 @@ The preprocessing pipeline should be configurable for future experiments.
 
 # Phase 5 — Baseline Models
 
-**Status:** In Progress
+**Status:** Completed (S1, reduced 2B)
 
 ## Stage 1 — Binary Classification
 
@@ -406,7 +406,7 @@ Digit (`0–9`)
 
 # Phase 6 — Deep Learning Models
 
-**Status:** Not Started
+**Status:** Completed (S1, reduced 2B)
 
 ## Primary Model
 
