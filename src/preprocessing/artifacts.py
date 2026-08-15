@@ -20,13 +20,10 @@ from scipy.stats import kurtosis as kurt_fn
 
 def detect_bad_channels(scale: np.ndarray, floor: float = 1e-7) -> list[int]:
     """
-    scale: per-channel MAD-derived scale from fit_normalization_robust,
-    fit on the FULL nominal channel set (before any exclusion).
-    Returns indices of channels at/near the numerical floor - a signature
-    of a channel that's mostly constant with rare large spikes (dead/
-    faulty electrode), not a real per-trial artifact.
+    ...
+    Returns indices of channels showing the dead/faulty-electrode signature...
     """
-    return list(np.where(scale.squeeze() <= floor)[0])
+    return [int(c) for c in np.where(scale.squeeze() <= floor)[0]]
 
 
 def exclude_channels(eeg: np.ndarray, bad_channels: list[int], n_channels_nominal: int) -> tuple[np.ndarray, np.ndarray]:
