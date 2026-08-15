@@ -306,7 +306,7 @@ def _save_results(cfg: PipelineConfig, results: dict) -> None:
     print(f"Results saved to {results_dir / 'results.json'}")
 
 
-def run_model_classical(cfg: PipelineConfig) -> dict:
+def run_model_classical(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     X_train, y_train, X_val, y_val, average = _load_stage_data_classical(cfg)
 
     scaler = StandardScaler()
@@ -325,42 +325,44 @@ def run_model_classical(cfg: PipelineConfig) -> dict:
     joblib.dump({"model": fitted_model, "scaler": scaler}, checkpoint_path)
     print(f"Model saved to {checkpoint_path}")
 
-    print("Running permutation test...")
-    # Subsample for the permutation test specifically - it only needs a
-    # rough noise-floor estimate, not production precision (see
-    # PermutationTestConfig docstring).
-    n = cfg.permutation.classical_subsample_size
-    if n is not None and n < len(X_train_scaled):
-        rng = np.random.default_rng(cfg.seed)
-        idx = rng.choice(len(X_train_scaled), size=n, replace=False)
-        X_perm, y_perm = X_train_scaled[idx], y_train[idx]
-    else:
-        X_perm, y_perm = X_train_scaled, y_train
+    permutation_result = None
+    if run_permutation:
+        print("Running permutation test...")
+        n = cfg.permutation.classical_subsample_size
+        if n is not None and n < len(X_train_scaled):
+            rng = np.random.default_rng(cfg.seed)
+            idx = rng.choice(len(X_train_scaled), size=n, replace=False)
+            X_perm, y_perm = X_train_scaled[idx], y_train[idx]
+        else:
+            X_perm, y_perm = X_train_scaled, y_train
 
-    model_fn = lambda: build_classical_model_for_permutation(
-        cfg.model, cfg.seed, cfg.permutation.svm_permutation_max_iter
-    )
-    real_acc, shuffled_accs = permutation_test_sklearn(
-        model_fn, X_perm, y_perm, X_val_scaled, y_val,
-        n_permutations=cfg.permutation.n_permutations_classical, seed=cfg.seed,
-    )
-    gap = real_acc - shuffled_accs.mean()
+        model_fn = lambda: build_classical_model_for_permutation(
+            cfg.model, cfg.seed, cfg.permutation.svm_permutation_max_iter
+        )
+        real_acc, shuffled_accs = permutation_test_sklearn(
+            model_fn, X_perm, y_perm, X_val_scaled, y_val,
+            n_permutations=cfg.permutation.n_permutations_classical, seed=cfg.seed,
+        )
+        gap = real_acc - shuffled_accs.mean()
+        permutation_result = {
+            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
+            "shuffled_std": shuffled_accs.std(),
+            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
+        }
+    else:
+        print("Skipping permutation test (run_permutation=False).")
 
     results = {
         "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage, "model": cfg.model.model_name},
         "metrics": metrics,
         "confusion_matrix": cm.tolist(),
-        "permutation_test": {
-            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
-            "shuffled_std": shuffled_accs.std(),
-            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
-        },
+        "permutation_test": permutation_result,
     }
     _save_results(cfg, results)
     return results
 
 
-def run_model_deep(cfg: PipelineConfig) -> dict:
+def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     # Deferred import: torch is only required when a deep model is actually
     # selected, so classical-only usage of this package never needs it installed.
     import torch
@@ -407,55 +409,76 @@ def run_model_deep(cfg: PipelineConfig) -> dict:
     }
     print(metrics)
 
-    print("Running (reduced-scale) permutation test...")
+    permutation_result = None
+    if run_permutation:
+        print("Running (reduced-scale) permutation test...")
+        
+        def train_fn(eeg_sub, y_sub):
+            m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
+            opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
+            crit = nn.CrossEntropyLoss()
+            loader = DataLoader(
+                EEGDataset(eeg_sub, y_sub),
+                batch_size=cfg.training.batch_size,
+                shuffle=True,
+            )
+            for _ in range(cfg.permutation.deep_quick_epochs):
+                run_epoch(m, loader, opt, crit, device, train=True)
+            return m
 
-    def train_fn(eeg_sub, y_sub):
-        m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
-        opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
-        crit = nn.CrossEntropyLoss()
-        loader = DataLoader(EEGDataset(eeg_sub, y_sub), batch_size=cfg.training.batch_size, shuffle=True)
-        for _ in range(cfg.permutation.deep_quick_epochs):
-            run_epoch(m, loader, opt, crit, device, train=True)
-        return m
+        def eval_fn(m, loader):
+            m.eval()
+            preds, labels = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in loader:
+                    logits = m(X_batch.to(device))
+                    preds.extend(logits.argmax(dim=1).cpu().numpy())
+                    labels.extend(y_batch.numpy())
+            return accuracy_score(labels, preds)
 
-    def eval_fn(m, loader):
-        m.eval()
-        preds, labels = [], []
-        with torch.no_grad():
-            for X_batch, y_batch in loader:
-                logits = m(X_batch.to(device))
-                preds.extend(logits.argmax(dim=1).cpu().numpy())
-                labels.extend(y_batch.numpy())
-        return accuracy_score(labels, preds)
+        real_acc, shuffled_accs = permutation_test_torch(
+            train_fn,
+            eval_fn,
+            eeg_train,
+            y_train,
+            val_loader,
+            n_permutations=cfg.permutation.n_permutations_deep,
+            subsample_size=cfg.permutation.deep_subsample_size,
+            seed=cfg.seed,
+        )
 
-    real_acc, shuffled_accs = permutation_test_torch(
-        train_fn, eval_fn, eeg_train, y_train, val_loader,
-        n_permutations=cfg.permutation.n_permutations_deep,
-        subsample_size=cfg.permutation.deep_subsample_size, seed=cfg.seed,
-    )
-    gap = real_acc - shuffled_accs.mean()
+        gap = real_acc - shuffled_accs.mean()
+
+        permutation_result = {
+            "real_accuracy": real_acc,
+            "shuffled_mean": shuffled_accs.mean(),
+            "shuffled_std": shuffled_accs.std(),
+            "gap": gap,
+            "gap_over_std": (
+                gap / shuffled_accs.std()
+                if shuffled_accs.std() > 0
+                else None
+            ),
+        }
+    else:
+        print("Skipping permutation test (run_permutation=False).")
 
     results = {
         "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage, "model": cfg.model.model_name},
         "metrics": metrics,
         "best_val_acc": history["best_val_acc"],
-        "permutation_test": {
-            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
-            "shuffled_std": shuffled_accs.std(),
-            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
-        },
+        "permutation_test": permutation_result,
     }
+    
     _save_results(cfg, results)
     return results
 
 
-def run_phase5_6_model(cfg: PipelineConfig) -> dict:
-    """Single entry point for modeling - branches on cfg.model.is_deep so
-    callers never need to know which path they're triggering."""
+def run_phase5_6_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     if cfg.model.is_deep:
-        return run_model_deep(cfg)
+        return run_model_deep(cfg, run_permutation=run_permutation)
     else:
-        return run_model_classical(cfg)
+        return run_model_classical(cfg, run_permutation=run_permutation)
 
 
 # ---------------------------------------------------------------------------
