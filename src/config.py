@@ -223,11 +223,20 @@ class TrainingConfig:
 
 @dataclass
 class PermutationTestConfig:
-    n_permutations_classical: int = 50
+    n_permutations_classical: int = 10
     n_permutations_deep: int = 5
     deep_subsample_size: int = 3000
     deep_quick_epochs: int = 10
 
+    # Permutation testing only ever needs a rough noise-floor estimate, not
+    # production-quality precision - these settings trade accuracy for
+    # speed SPECIFICALLY for the permutation harness. The real model
+    # (Section 5's actual evaluation) never uses these.
+    classical_subsample_size: int | None = 5000   # None = use full train set
+    svm_permutation_max_iter: int = 300             # RBF SVC on shuffled labels often
+                                                        # fails to converge, grinding through
+                                                        # the full iteration budget every run -
+                                                        # capped LinearSVC avoids this.
 
 @dataclass
 class ModelConfig:

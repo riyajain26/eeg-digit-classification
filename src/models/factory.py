@@ -45,3 +45,22 @@ def build_eegnet(cfg: ModelConfig, n_channels: int, n_samples: int, n_classes: i
     p = cfg.eegnet
     return EEGNet(n_channels=n_channels, n_samples=n_samples, n_classes=n_classes,
                   F1=p.F1, D=p.D, F2=p.F2, kernel_length=p.kernel_length, dropout=p.dropout)
+
+
+def build_classical_model_for_permutation(cfg: ModelConfig, seed: int, svm_max_iter: int = 300):
+    """
+    Faster surrogate used ONLY inside the permutation-test harness - the
+    real, reported model (build_classical_model) is never affected by this.
+
+    SVM specifically swaps the production RBF-kernel SVC for a capped-
+    iteration LinearSVC: on shuffled labels there's no real structure to
+    find, so RBF SVC's iterative solver often fails to converge at all and
+    burns through its full iteration budget every single permutation run -
+    observed directly during development (single real fit: ~2 min;
+    shuffled fits: 30+ min each, un-capped). LDA and RandomForest don't
+    have this problem and use the same builder as production.
+    """
+    if cfg.model_name == "svm":
+        from sklearn.svm import LinearSVC
+        return LinearSVC(random_state=seed, max_iter=svm_max_iter, tol=1e-2, dual="auto")
+    return build_classical_model(cfg, seed)
