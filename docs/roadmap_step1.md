@@ -1,4 +1,4 @@
-# EEG Digit Classification Roadmap
+# Stage 1 Roadmap — Binary Digit Classification (Digit vs No Digit)
 
 ## Project Goal
 
@@ -46,10 +46,10 @@ digit-only data:
 | Data acquisition & storage     | Done           | Done (same files, filtered by `label_digit != -1`) |
 | Leakage-safe splitting         | Done           | Done (same split, digit-only subset) |
 | Permutation-test harness       | Done           | Deferred — needs stratified sampling |
-| Preprocessing pipeline         | In progress    | Deferred |
-| Baseline models (Phase 5)      | Not started    | Deferred |
-| Deep learning model (Phase 6)  | Not started    | Deferred — depends on Stage 1's trained backbone |
-| Evaluation (Phase 7)           | Not started    | Deferred |
+| Preprocessing pipeline         | Done           | Deferred |
+| Baseline models (Phase 5)      | Done           | Deferred |
+| Deep learning model (Phase 6)  | Done           | Deferred — depends on Stage 1's trained backbone |
+| Evaluation (Phase 7)           | Done           | Deferred |
 
 Rule of thumb: any phase marked "Deferred" for Stage 2 gets revisited only
 after the same phase is complete for Stage 1.
@@ -434,7 +434,7 @@ Track:
 
 # Phase 7 — Evaluation & Analysis
 
-**Status:** Not Started
+**Status:** Completed (S1, reduced 2B)
 
 ## Binary Classification
 
