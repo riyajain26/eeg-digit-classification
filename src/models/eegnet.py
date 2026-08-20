@@ -56,3 +56,24 @@ class EEGNet(nn.Module):
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def freeze_backbone(self) -> None:
+        """Locks every parameter except the final classifier layer - used
+        by Stage 2 Paths B1/B2 to reuse a Stage 1-trained backbone as a
+        fixed feature extractor."""
+        for name, param in self.named_parameters():
+            if not name.startswith("classifier"):
+                param.requires_grad = False
+
+    def unfreeze_backbone(self) -> None:
+        """Unlocks every parameter - used by Path B2's fine-tuning phase,
+        after an initial freeze-only phase."""
+        for param in self.parameters():
+            param.requires_grad = True
+
+    def replace_classifier(self, n_classes: int) -> None:
+        """Swaps the final layer for a new output size (e.g. Stage 1's
+        2-class head -> Stage 2's 10-class head), keeping every earlier
+        layer (and its weights) unchanged."""
+        in_features = self.classifier.in_features
+        self.classifier = nn.Linear(in_features, n_classes)

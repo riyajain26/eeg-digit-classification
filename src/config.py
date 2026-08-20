@@ -238,6 +238,26 @@ class PermutationTestConfig:
                                                         # the full iteration budget every run -
                                                         # capped LinearSVC avoids this.
 
+
+@dataclass
+class Stage2Config:
+    # Only relevant when stage="stage2" AND model_name="eegnet". Registry
+    # key into STAGE2_MODEL_REGISTRY (models/factory.py) - "path_a" (fresh,
+    # no reuse), "path_b1" (frozen backbone), "path_b2" (frozen then
+    # fine-tuned). Adding a new variant later: write one function, add one
+    # registry entry - no changes needed here or in pipeline.py.
+    variant: str = "path_a"
+
+    # Path B2 only: epochs spent training just the new head with the
+    # backbone frozen, before unfreezing for the fine-tune phase.
+    freeze_epochs: int = 15
+    # Path B2 only: fine-tune phase learning rate, as a fraction of the
+    # base training LR - kept low to avoid catastrophic forgetting of
+    # Stage 1's learned features.
+    finetune_lr_multiplier: float = 0.1
+    finetune_epochs: int = 15
+
+
 @dataclass
 class ModelConfig:
     # --- The two params a user sets to control modeling ---
@@ -248,6 +268,7 @@ class ModelConfig:
     svm: SVMParams = field(default_factory=SVMParams)
     random_forest: RandomForestParams = field(default_factory=RandomForestParams)
     eegnet: EEGNetParams = field(default_factory=EEGNetParams)
+    stage2: Stage2Config = field(default_factory=Stage2Config)
 
     model_root: Path = field(default_factory=lambda: Path("models"))
 
@@ -263,9 +284,14 @@ class ModelConfig:
         return self.model_name in DEEP_MODEL_NAMES
 
     def run_tag(self, dataset_variant_tag: str) -> str:
-        """Unique tag for this exact (dataset scale, stage, model) combination -
-        used for checkpoints and results, so nothing overwrites a different run."""
-        return f"{dataset_variant_tag}__{self.stage}__{self.model_name}"
+        """Unique tag for this exact (dataset scale, stage, model[, stage2
+        variant]) combination - used for checkpoints and results, so
+        different Stage 2 EEGNet variants (A/B1/B2) never overwrite each
+        other on disk."""
+        tag = f"{dataset_variant_tag}__{self.stage}__{self.model_name}"
+        if self.stage == "stage2" and self.model_name == "eegnet":
+            tag += f"__{self.stage2.variant}"
+        return tag
 
     def preprocessing_dir(self, dataset_variant_tag: str) -> Path:
         # Fitted normalization/artifact params depend on dataset scale ONLY
@@ -300,18 +326,24 @@ def build_config(
     subsample_fraction: float = 0.20,
     stage: str = "stage1",
     model_name: str = "random_forest",
+    stage2_variant: str = "path_a",
     seed: int = 42,
 ) -> PipelineConfig:
     """
-    The intended entry point for users: set these ~5 parameters, get back a
+    The intended entry point for users: set these ~6 parameters, get back a
     fully-wired config. Everything else (paths, trial counts, HF repo id,
     which training path runs) derives automatically.
+
+    stage2_variant only matters when stage="stage2" and model_name="eegnet" -
+    "path_a" (fresh), "path_b1" (frozen Stage 1 backbone), "path_b2"
+    (frozen then fine-tuned).
     """
     cfg = PipelineConfig()
     cfg.data.dataset_variant = dataset_variant
     cfg.data.subsample_fraction = subsample_fraction
     cfg.model.stage = stage
     cfg.model.model_name = model_name
+    cfg.model.stage2.variant = stage2_variant
     cfg.model.__post_init__()   # re-validate after manual assignment
     cfg.seed = seed
     cfg.split.seed = seed

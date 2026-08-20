@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from src.config import PipelineConfig, build_config
+from src.config import PipelineConfig, ModelConfig, build_config
 from src.data.conversion import extract_split
 from src.data.splitting import (check_session_overlap, assign_block_splits,
                                   validate_split, materialize_split)
@@ -40,7 +40,8 @@ from src.preprocessing.artifacts import (detect_bad_channels, exclude_channels,
                                             compute_artifact_arrays, derive_thresholds,
                                             flag_artifacts, save_artifact_params, load_artifact_params)
 from src.features.extraction import extract_features_batch
-from src.models.factory import build_classical_model, build_classical_model_for_permutation, build_eegnet
+from src.models.factory import (build_classical_model, build_classical_model_for_permutation,
+                                  build_eegnet, build_stage2_eegnet)
 from src.evaluation.metrics import evaluate_sklearn_model
 from src.evaluation.permutation_test import permutation_test_sklearn, permutation_test_torch
 
@@ -362,32 +363,64 @@ def run_model_classical(cfg: PipelineConfig, run_permutation: bool = True) -> di
     return results
 
 
+def _stage1_eegnet_checkpoint_path(cfg: PipelineConfig) -> Path:
+    """
+    Stage 1's EEGNet checkpoint lives under a DIFFERENT run_tag (same
+    variant_tag, but stage='stage1' instead of 'stage2') - built as a
+    one-off ModelConfig matching Stage 1's exact naming, not cfg.model
+    itself (which is Stage 2's config at the point this is called).
+    """
+    from src.config import ModelConfig
+    stage1_model_cfg = ModelConfig(model_name="eegnet", stage="stage1", model_root=cfg.model.model_root)
+    return stage1_model_cfg.checkpoint_path(cfg.data.variant_tag)
+
+
 def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     # Deferred import: torch is only required when a deep model is actually
     # selected, so classical-only usage of this package never needs it installed.
     import torch
-    from src.training.loop import make_loaders, train_with_checkpointing, run_epoch, EEGDataset
+    from src.training.loop import (make_loaders, train_with_checkpointing, train_stage2_path_b2,
+                                     run_epoch, EEGDataset)
     from torch.utils.data import DataLoader
     import torch.nn as nn
 
     eeg_train, y_train, eeg_val, y_val = _load_stage_data_deep(cfg)
     n_channels, n_samples = eeg_train.shape[1], eeg_train.shape[2]
     n_classes = 2 if cfg.model.stage == "stage1" else 10
+    is_stage2 = cfg.model.stage == "stage2"
+    variant = cfg.model.stage2.variant if is_stage2 else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Phase 6 [{cfg.model.stage}/{cfg.model.model_name}]: using device {device}")
+    label = f"{cfg.model.stage}/{cfg.model.model_name}" + (f"/{variant}" if variant else "")
+    print(f"Phase 6 [{label}]: using device {device}")
     torch.manual_seed(cfg.seed)
 
     train_loader, val_loader = make_loaders(eeg_train, y_train, eeg_val, y_val, cfg.training.batch_size)
-    model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
+
+    if is_stage2:
+        stage1_ckpt = _stage1_eegnet_checkpoint_path(cfg)
+        model = build_stage2_eegnet(cfg.model, n_channels, n_samples, n_classes,
+                                     stage1_checkpoint_path=stage1_ckpt).to(device)
+    else:
+        model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
 
     checkpoint_path = cfg.model.checkpoint_path(cfg.data.variant_tag)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    history = train_with_checkpointing(
-        model, train_loader, val_loader, checkpoint_path, device,
-        cfg.training.n_epochs, cfg.training.learning_rate, cfg.training.early_stop_patience,
-    )
+    if is_stage2 and variant == "path_b2":
+        s2 = cfg.model.stage2
+        history = train_stage2_path_b2(
+            model, train_loader, val_loader, checkpoint_path, device,
+            freeze_epochs=s2.freeze_epochs, finetune_epochs=s2.finetune_epochs,
+            base_learning_rate=cfg.training.learning_rate,
+            finetune_lr_multiplier=s2.finetune_lr_multiplier,
+            early_stop_patience=cfg.training.early_stop_patience,
+        )
+    else:
+        history = train_with_checkpointing(
+            model, train_loader, val_loader, checkpoint_path, device,
+            cfg.training.n_epochs, cfg.training.learning_rate, cfg.training.early_stop_patience,
+        )
 
     model.load_state_dict(torch.load(checkpoint_path))
     model.eval()
@@ -412,16 +445,12 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     permutation_result = None
     if run_permutation:
         print("Running (reduced-scale) permutation test...")
-        
+
         def train_fn(eeg_sub, y_sub):
             m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
             opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
             crit = nn.CrossEntropyLoss()
-            loader = DataLoader(
-                EEGDataset(eeg_sub, y_sub),
-                batch_size=cfg.training.batch_size,
-                shuffle=True,
-            )
+            loader = DataLoader(EEGDataset(eeg_sub, y_sub), batch_size=cfg.training.batch_size, shuffle=True)
             for _ in range(cfg.permutation.deep_quick_epochs):
                 run_epoch(m, loader, opt, crit, device, train=True)
             return m
@@ -437,44 +466,33 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
             return accuracy_score(labels, preds)
 
         real_acc, shuffled_accs = permutation_test_torch(
-            train_fn,
-            eval_fn,
-            eeg_train,
-            y_train,
-            val_loader,
+            train_fn, eval_fn, eeg_train, y_train, val_loader,
             n_permutations=cfg.permutation.n_permutations_deep,
-            subsample_size=cfg.permutation.deep_subsample_size,
-            seed=cfg.seed,
+            subsample_size=cfg.permutation.deep_subsample_size, seed=cfg.seed,
         )
-
         gap = real_acc - shuffled_accs.mean()
-
         permutation_result = {
-            "real_accuracy": real_acc,
-            "shuffled_mean": shuffled_accs.mean(),
+            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
             "shuffled_std": shuffled_accs.std(),
-            "gap": gap,
-            "gap_over_std": (
-                gap / shuffled_accs.std()
-                if shuffled_accs.std() > 0
-                else None
-            ),
+            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
         }
     else:
         print("Skipping permutation test (run_permutation=False).")
 
     results = {
-        "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage, "model": cfg.model.model_name},
+        "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage,
+                   "model": cfg.model.model_name, "stage2_variant": variant},
         "metrics": metrics,
         "best_val_acc": history["best_val_acc"],
         "permutation_test": permutation_result,
     }
-    
     _save_results(cfg, results)
     return results
 
 
 def run_phase5_6_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
+    """Single entry point for modeling - branches on cfg.model.is_deep so
+    callers never need to know which path they're triggering."""
     if cfg.model.is_deep:
         return run_model_deep(cfg, run_permutation=run_permutation)
     else:
