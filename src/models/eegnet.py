@@ -77,3 +77,54 @@ class EEGNet(nn.Module):
         layer (and its weights) unchanged."""
         in_features = self.classifier.in_features
         self.classifier = nn.Linear(in_features, n_classes)
+
+
+class EEGNetDualBackbone(nn.Module):
+    """
+    Path C: raw EEG is fed to BOTH a FROZEN Stage 1 backbone (its learned
+    features, fixed) and a FRESH, trainable backbone (learns directly for
+    Stage 2) - their outputs are concatenated before a new classifier head.
+
+    Distinct from Path B (B1/B2), which only ever sees Stage 1's features -
+    here Stage 2 always has direct access to the raw signal too, alongside
+    whatever Stage 1 learned.
+    """
+
+    def __init__(self, stage1_backbone: EEGNet, stage2_backbone: EEGNet, n_classes: int,
+                 n_channels: int, n_samples: int):
+        super().__init__()
+        self.stage1_backbone = stage1_backbone
+        self.stage2_backbone = stage2_backbone
+
+        for param in self.stage1_backbone.parameters():
+            param.requires_grad = False
+        self.stage1_backbone.eval()
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, n_channels, n_samples)
+            feat1_dim = self.stage1_backbone._forward_features(dummy).shape[1]
+            feat2_dim = self.stage2_backbone._forward_features(dummy).shape[1]
+
+        self.classifier = nn.Linear(feat1_dim + feat2_dim, n_classes)
+
+    def forward(self, x):
+        with torch.no_grad():
+            feat1 = self.stage1_backbone._forward_features(x)
+        feat2 = self.stage2_backbone._forward_features(x)
+        combined = torch.cat([feat1, feat2], dim=1)
+        return self.classifier(combined)
+
+    def train(self, mode: bool = True):
+        """
+        Overridden so stage1_backbone STAYS in eval mode even when the
+        outer model is set to train() (which happens every epoch) -
+        without this, its BatchNorm layers would start updating their
+        running statistics based on Stage 2 data, silently corrupting the
+        "frozen, fixed feature extractor" property this variant depends on.
+        """
+        super().train(mode)
+        self.stage1_backbone.eval()
+        return self
+
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
