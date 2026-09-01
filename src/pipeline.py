@@ -109,18 +109,33 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
     test_path = cfg.data.splits_dir / "test.h5"
 
     overlap = check_session_overlap(train_pool_path, test_path)
-    if overlap:
-        raise RuntimeError(
-            f"Session overlap found: {overlap}. HF's train/test boundary is NOT "
-            f"leakage-safe for dataset_variant={cfg.data.dataset_variant!r} - resolve "
-            "before proceeding."
-        )
-    print("Phase 3: session overlap check passed.")
-
     with h5py.File(train_pool_path, "r") as f:
         sessionnum, blocknum = f["sessionnum"][:], f["blocknum"][:]
 
+    total_sessions = len(set(sessionnum.tolist()))
+
+    if overlap:
+        overlap_fraction = len(overlap) / total_sessions
+        if overlap_fraction > 0.05:
+            raise RuntimeError(
+                f"Session overlap found: {overlap} ({overlap_fraction:.1%} of train pool sessions). "
+                "Too large to treat as an isolated edge case - HF's train/test boundary may not "
+                "be leakage-safe overall. Resolve before proceeding (e.g. a custom 3-way split)."
+            )
+        print(f"Phase 3: WARNING - {len(overlap)} session(s) overlap between train pool and test "
+              f"({overlap_fraction:.2%} of train sessions): {overlap}. Excluding these sessions' "
+              "trials from train/val - test remains untouched as the official held-out set.")
+    else:
+        print("Phase 3: session overlap check passed - zero overlap.")
+
     trial_splits = assign_block_splits(sessionnum, blocknum, cfg.split.val_fraction, cfg.split.seed)
+
+    if overlap:
+        exclude_mask = np.isin(sessionnum, list(overlap))
+        trial_splits = trial_splits.copy()
+        trial_splits[exclude_mask] = "excluded"
+        print(f"Phase 3: excluded {exclude_mask.sum()} trials from {len(overlap)} overlapping session(s).")
+
     validation = validate_split(sessionnum, blocknum, trial_splits)
     if validation["block_overlap"]:
         raise RuntimeError(f"Block overlap detected: {validation['block_overlap']}")
@@ -128,6 +143,7 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
 
     materialize_split(train_pool_path, trial_splits, {"train": train_path, "val": val_path})
     print(f"Phase 3: wrote {train_path} and {val_path}.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -704,20 +720,14 @@ def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 def main(
-    dataset_variant: str = "2B",
-    subsample_fraction: float = 0.20,
-    stage: str = "stage1",
-    model_name: str = "random_forest",
-    seed: int = 42,
-    force: bool = False,
-) -> dict:
-    """
-    The intended way to run this pipeline: set these ~5 parameters, get a
-    fully-processed dataset and a trained, evaluated model back. Everything
-    else - paths, HF repo id, trial counts, which training code path runs -
-    is derived automatically from these.
-    """
-    cfg = build_config(dataset_variant, subsample_fraction, stage, model_name, seed)
+        dataset_variant: str = "2B", 
+        subsample_fraction: float = 0.20, 
+        stage: str = "stage1",
+        model_name: str = "random_forest", 
+        stage2_variant: str = "path_a",
+        seed: int = 42, 
+        force: bool = False) -> dict:
+    cfg = build_config(dataset_variant, subsample_fraction, stage, model_name, stage2_variant, seed)
     print(f"=== dataset_variant={dataset_variant!r} subsample_fraction={subsample_fraction} "
           f"stage={stage!r} model={model_name!r} ===")
 
