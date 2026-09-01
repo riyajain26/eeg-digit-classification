@@ -6,12 +6,14 @@ everything downstream (training, evaluation) just receives a ready model,
 without needing to know or care which one it is.
 """
 
+from pathlib import Path as _Path
+
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 
 from src.config import ModelConfig
-from src.models.eegnet import EEGNet
+from src.models.eegnet import EEGNet, EEGNetDualBackbone
 
 
 def build_classical_model(cfg: ModelConfig, seed: int):
@@ -129,16 +131,28 @@ def _build_stage2_path_b2(cfg: ModelConfig, n_channels: int, n_samples: int,
     return model
 
 
+def _build_stage2_path_c(cfg: ModelConfig, n_channels: int, n_samples: int,
+                           n_classes: int, stage1_checkpoint_path=None) -> EEGNetDualBackbone:
+    """Raw EEG fed to BOTH a frozen Stage 1 backbone AND a fresh trainable
+    backbone, concatenated before a new classifier head."""
+    stage1_backbone = _load_stage1_backbone(cfg, n_channels, n_samples, stage1_checkpoint_path)
+    # This fresh EEGNet's own classifier head is unused/discarded - only its
+    # _forward_features() output feeds into EEGNetDualBackbone's classifier.
+    # Kept as a full EEGNet instance for simplicity rather than a stripped variant.
+    stage2_backbone = build_eegnet(cfg, n_channels, n_samples, n_classes=n_classes)
+    return EEGNetDualBackbone(stage1_backbone, stage2_backbone, n_classes, n_channels, n_samples)
+
+
 STAGE2_MODEL_REGISTRY = {
     "path_a": _build_stage2_path_a,
     "path_b1": _build_stage2_path_b1,
     "path_b2": _build_stage2_path_b2,
+    "path_c": _build_stage2_path_c,
 }
 
 
 def build_stage2_eegnet(cfg: ModelConfig, n_channels: int, n_samples: int, n_classes: int,
-                          stage1_checkpoint_path=None) -> EEGNet:
-    """Dispatches to the registered builder for cfg.stage2.variant."""
+                          stage1_checkpoint_path=None):
     if cfg.stage2.variant not in STAGE2_MODEL_REGISTRY:
         raise ValueError(f"Unknown stage2 variant {cfg.stage2.variant!r}. "
                           f"Known: {list(STAGE2_MODEL_REGISTRY)}")

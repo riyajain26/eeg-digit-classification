@@ -201,9 +201,15 @@ class RandomForestParams:
 
 @dataclass
 class EEGNetParams:
-    F1: int = 8
+    # Updated defaults per empirical finding: F1=16/F2=32 clearly beat the
+    # original Stage-1-inherited F1=8/F2=16 on Stage 2's harder 10-way task
+    # (properly evaluated with the real block-aware split, not the naive
+    # sweep split which overstated the gain). Tripling further (F1=24/F2=48)
+    # showed clear overfitting - this is the validated sweet spot, not an
+    # arbitrary choice.
+    F1: int = 16
     D: int = 2
-    F2: int = 16
+    F2: int = 32
     kernel_length: int = 64
     dropout: float = 0.5
 

@@ -42,7 +42,7 @@ from src.preprocessing.artifacts import (detect_bad_channels, exclude_channels,
 from src.features.extraction import extract_features_batch
 from src.models.factory import (build_classical_model, build_classical_model_for_permutation,
                                   build_eegnet, build_stage2_eegnet)
-from src.evaluation.metrics import evaluate_sklearn_model
+from src.evaluation.metrics import evaluate_sklearn_model, compute_classification_metrics
 from src.evaluation.permutation_test import permutation_test_sklearn, permutation_test_torch
 
 
@@ -417,6 +417,9 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
             early_stop_patience=cfg.training.early_stop_patience,
         )
     else:
+        # Path A, B1, and C (Path C's frozen stage1_backbone has requires_grad=False,
+        # so train_with_checkpointing's optimizer correctly only updates the
+        # trainable stage2_backbone + classifier) all use standard single-phase training.
         history = train_with_checkpointing(
             model, train_loader, val_loader, checkpoint_path, device,
             cfg.training.n_epochs, cfg.training.learning_rate, cfg.training.early_stop_patience,
@@ -445,7 +448,12 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     permutation_result = None
     if run_permutation:
         print("Running (reduced-scale) permutation test...")
-
+        # Deliberately uses a FRESH model (Path A style) for the permutation
+        # harness regardless of which variant is being evaluated (same
+        # surrogate-model principle as the SVM permutation fix) - repeating
+        # B2's two-phase procedure or Path C's dual-backbone construction for
+        # every shuffled run would be prohibitively expensive for what's only
+        # meant to be a rough noise-floor check.
         def train_fn(eeg_sub, y_sub):
             m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
             opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
@@ -635,7 +643,12 @@ def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
         n_classes = 2 if cfg.model.stage == "stage1" else 10
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
+        if cfg.model.stage == "stage2":
+            stage1_ckpt = _stage1_eegnet_checkpoint_path(cfg)
+            model = build_stage2_eegnet(cfg.model, n_channels, n_samples, n_classes,
+                                         stage1_checkpoint_path=stage1_ckpt).to(device)
+        else:
+            model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         model.eval()
 
