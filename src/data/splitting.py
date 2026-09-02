@@ -58,23 +58,14 @@ def validate_split(sessionnum, blocknum, trial_splits: np.ndarray) -> dict:
     }
 
 
-def materialize_split(
-    source_path: Path,
-    trial_splits: np.ndarray,
-    output_paths: dict[str, Path],
-) -> None:
-    """
-    Writes separate output files per split (not a shared file + mask) — for
-    faster reads and to make mixing splits structurally impossible later.
-    """
+def materialize_split(source_path: Path, trial_splits: np.ndarray, output_paths: dict[str, Path]) -> None:
     with h5py.File(source_path, "r") as src:
         keys = list(src.keys())
-
         for split_name, out_path in output_paths.items():
-            mask = trial_splits == split_name
+            idx = np.where(trial_splits == split_name)[0]   # always ascending - required for h5py fancy indexing
             with h5py.File(out_path, "w") as dst:
                 for key in keys:
                     dst.create_dataset(
-                        key, data=src[key][:][mask],
+                        key, data=src[key][idx],   # reads ONLY these rows from disk, not the full array
                         compression="gzip" if key == "eeg" else None,
                     )
