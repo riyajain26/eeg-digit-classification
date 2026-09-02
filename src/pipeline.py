@@ -153,7 +153,7 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
 _phase4_cache: dict = {}   # module-level cache: raw (channel-excluded) arrays for phase4b to reuse
 
 
-def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False) -> None:
+def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False, diagnostic_subsample_size: int = 5000) -> None:
     cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
     preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
@@ -168,35 +168,53 @@ def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False) -> None:
         val_path = cfg.data.splits_dir / "val.h5"
 
         with h5py.File(train_path, "r") as f:
-            eeg_train_raw = f["eeg"][:]
+            n_train = f["eeg"].shape[0]
             label_binary_train = f["label_binary"][:]
             label_digit_train = f["label_digit"][:]
+            # Diagnostic pass: subsample rather than loading everything -
+            # bad-channel detection and threshold derivation are statistical
+            # estimates that converge well from a representative subset.
+            if n_train > diagnostic_subsample_size:
+                rng = np.random.default_rng(cfg.seed)
+                diag_idx = np.sort(rng.choice(n_train, size=diagnostic_subsample_size, replace=False))
+                eeg_diag = f["eeg"][diag_idx]
+            else:
+                eeg_diag = f["eeg"][:]
+
+        fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
+
+        print(f"Phase 4: filtering diagnostic subsample ({len(eeg_diag)} of {n_train} trials)...")
+        eeg_diag_filtered = apply_filters(eeg_diag, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
+                                           fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
+        center_full, scale_full = fit_normalization_robust(eeg_diag_filtered)
+        bad_channels = detect_bad_channels(scale_full, ac.bad_channel_scale_floor)
+        print(f"Phase 4: bad channels: {bad_channels}")
+        del eeg_diag, eeg_diag_filtered   # free the diagnostic arrays immediately
+
+        with h5py.File(train_path, "r") as f:
+            eeg_train_raw = f["eeg"][:]
+        eeg_train_raw, good_channels = exclude_channels(eeg_train_raw, bad_channels, cfg.data.n_channels_nominal)
+
+        print("Phase 4: filtering train (full set)...")
+        eeg_train_filtered = apply_filters(eeg_train_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
+                                            fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
+        del eeg_train_raw   # NEW: free the raw copy the moment the filtered one exists
+
         with h5py.File(val_path, "r") as f:
             eeg_val_raw = f["eeg"][:]
             label_binary_val = f["label_binary"][:]
             label_digit_val = f["label_digit"][:]
-
-        fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
-
-        print("Phase 4: filtering (diagnostic pass, full channel set)...")
-        eeg_train_filtered_full = apply_filters(eeg_train_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                                 fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-        center_full, scale_full = fit_normalization_robust(eeg_train_filtered_full)
-        bad_channels = detect_bad_channels(scale_full, ac.bad_channel_scale_floor)
-        print(f"Phase 4: bad channels: {bad_channels}")
-
-        eeg_train_raw, good_channels = exclude_channels(eeg_train_raw, bad_channels, cfg.data.n_channels_nominal)
         eeg_val_raw, _ = exclude_channels(eeg_val_raw, bad_channels, cfg.data.n_channels_nominal)
-        eeg_train_filtered = eeg_train_filtered_full[:, good_channels, :]
-        del eeg_train_filtered_full
 
         print("Phase 4: filtering val...")
         eeg_val_filtered = apply_filters(eeg_val_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
                                           fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
+        del eeg_val_raw   # NEW: same reasoning, smaller benefit but free
 
         center, scale = fit_normalization_robust(eeg_train_filtered)
         eeg_train_norm = apply_normalization(eeg_train_filtered, center, scale)
         eeg_val_norm = apply_normalization(eeg_val_filtered, center, scale)
+        del eeg_train_filtered, eeg_val_filtered   # NEW: free once normalized copies exist
         save_normalization_params(preprocessing_dir / "normalization_params.npz", center, scale)
 
         train_arrays = compute_artifact_arrays(eeg_train_norm)
@@ -224,7 +242,7 @@ def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False) -> None:
         print(f"Phase 4: wrote {train_filtered_path} and {val_filtered_path}.")
 
         _phase4_cache[cfg.data.variant_tag] = {
-            "train": eeg_train_raw, "val": eeg_val_raw,
+            "train": eeg_train_norm, "val": eeg_val_norm,
             "label_binary_train": label_binary_train, "label_digit_train": label_digit_train,
             "label_binary_val": label_binary_val, "label_digit_val": label_digit_val,
         }
