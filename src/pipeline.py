@@ -220,7 +220,7 @@ def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path
 
 
 def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
-                               diagnostic_subsample_size: int = 5000, chunk_size: int = 2000) -> None:
+                               diagnostic_subsample_size: int = 25000, chunk_size: int = 2000) -> None:
     cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
     cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
     preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
@@ -288,7 +288,7 @@ def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
         print(f"\nPhase 4: train trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
     with h5py.File(val_filtered_path, "r") as f:
         print(f"Phase 4: val trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
-        
+
 
 def _run_phase4b_features(cfg: PipelineConfig, force: bool = False) -> None:
     cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
