@@ -152,103 +152,143 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
 
 _phase4_cache: dict = {}   # module-level cache: raw (channel-excluded) arrays for phase4b to reuse
 
+def _append_chunk(dset, chunk):
+    old_size = dset.shape[0]
+    dset.resize(old_size + chunk.shape[0], axis=0)
+    dset[old_size:old_size + chunk.shape[0]] = chunk
 
-def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False, diagnostic_subsample_size: int = 5000) -> None:
+
+def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path,
+                             bad_channels, good_channels, center, scale, thresholds,
+                             chunk_size=2000):
+    fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
+    n_good = len(good_channels)
+
+    with h5py.File(split_path, "r") as src:
+        n_total = src["eeg"].shape[0]
+        label_binary_all = src["label_binary"][:]
+        label_digit_all = src["label_digit"][:]
+
+        with h5py.File(out_filtered_path, "w") as f_filt, h5py.File(out_features_path, "w") as f_feat:
+            eeg_ds = f_filt.create_dataset("eeg", shape=(0, n_good, cfg.data.n_samples),
+                                            maxshape=(None, n_good, cfg.data.n_samples),
+                                            chunks=(1, n_good, cfg.data.n_samples),
+                                            compression="gzip", dtype="float32")
+            lb_ds = f_filt.create_dataset("label_binary", shape=(0,), maxshape=(None,), dtype="int8")
+            ld_ds = f_filt.create_dataset("label_digit", shape=(0,), maxshape=(None,), dtype="int8")
+            any_ds = f_filt.create_dataset("artifact_any", shape=(0, n_good), maxshape=(None, n_good), dtype="bool")
+            nflag_ds = f_filt.create_dataset("n_flagged_channels_per_trial", shape=(0,), maxshape=(None,), dtype="int64")
+            concern_ds = f_filt.create_dataset("trial_concern", shape=(0,), maxshape=(None,), dtype="bool")
+
+            feat_ds = feat_lb_ds = feat_ld_ds = None
+
+            for start in range(0, n_total, chunk_size):
+                end = min(start + chunk_size, n_total)
+                eeg_chunk = src["eeg"][start:end]   # contiguous slice - efficient, only this chunk in memory
+                eeg_chunk, _ = exclude_channels(eeg_chunk, bad_channels, cfg.data.n_channels_nominal)
+
+                # Path B: filter -> normalize (reusing pre-fit center/scale) -> flag
+                filtered_chunk = apply_filters(eeg_chunk, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
+                                                fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
+                norm_chunk = apply_normalization(filtered_chunk, center, scale)
+                arrays_chunk = compute_artifact_arrays(norm_chunk)
+                flags_chunk = flag_artifacts(arrays_chunk, thresholds, ac.trial_concern_min_channels)
+
+                _append_chunk(eeg_ds, norm_chunk)
+                _append_chunk(lb_ds, label_binary_all[start:end])
+                _append_chunk(ld_ds, label_digit_all[start:end])
+                _append_chunk(any_ds, flags_chunk["any"])
+                _append_chunk(nflag_ds, flags_chunk["n_flagged_channels_per_trial"])
+                _append_chunk(concern_ds, flags_chunk["trial_concern"])
+
+                # Path A: features on RAW (channel-excluded, unfiltered) chunk -
+                # same underlying data read, no second pass through the source file
+                features_chunk = extract_features_batch(eeg_chunk, fs, cfg.feature.eeg_bands, cfg.feature.welch_nperseg)
+                if feat_ds is None:
+                    n_feat = features_chunk.shape[1]
+                    feat_ds = f_feat.create_dataset("features", shape=(0, n_feat), maxshape=(None, n_feat),
+                                                     compression="gzip", dtype="float32")
+                    feat_lb_ds = f_feat.create_dataset("label_binary", shape=(0,), maxshape=(None,), dtype="int8")
+                    feat_ld_ds = f_feat.create_dataset("label_digit", shape=(0,), maxshape=(None,), dtype="int8")
+                _append_chunk(feat_ds, features_chunk)
+                _append_chunk(feat_lb_ds, label_binary_all[start:end])
+                _append_chunk(feat_ld_ds, label_digit_all[start:end])
+
+                print(f"  processed {end}/{n_total} trials...")
+
+            f_filt.create_dataset("channel_indices", data=good_channels)
+
+
+def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
+                               diagnostic_subsample_size: int = 5000, chunk_size: int = 2000) -> None:
     cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
+    cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
     preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
 
     train_filtered_path = cfg.data.filtered_dir / "train_filtered.h5"
     val_filtered_path = cfg.data.filtered_dir / "val_filtered.h5"
+    train_features_path = cfg.data.features_dir / "train_features.h5"
+    val_features_path = cfg.data.features_dir / "val_features.h5"
 
-    if not force and _exists(train_filtered_path) and _exists(val_filtered_path):
-        print("Phase 4 (preprocessing): filtered outputs already exist, skipping.")
-    else:
-        train_path = cfg.data.splits_dir / "train.h5"
-        val_path = cfg.data.splits_dir / "val.h5"
+    if not force and all(p.exists() for p in [train_filtered_path, val_filtered_path,
+                                                  train_features_path, val_features_path]):
+        print("Phase 4: all outputs already exist, skipping.")
+        return
 
-        with h5py.File(train_path, "r") as f:
-            n_train = f["eeg"].shape[0]
-            label_binary_train = f["label_binary"][:]
-            label_digit_train = f["label_digit"][:]
-            # Diagnostic pass: subsample rather than loading everything -
-            # bad-channel detection and threshold derivation are statistical
-            # estimates that converge well from a representative subset.
-            if n_train > diagnostic_subsample_size:
-                rng = np.random.default_rng(cfg.seed)
-                diag_idx = np.sort(rng.choice(n_train, size=diagnostic_subsample_size, replace=False))
-                eeg_diag = f["eeg"][diag_idx]
-            else:
-                eeg_diag = f["eeg"][:]
+    train_path = cfg.data.splits_dir / "train.h5"
+    val_path = cfg.data.splits_dir / "val.h5"
+    fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
 
-        fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
+    # --- Diagnostic pass: fit everything (bad channels, normalization,
+    # artifact thresholds) from ONE small subsample - the only data held
+    # fully in memory at any point. ---
+    with h5py.File(train_path, "r") as f:
+        n_train = f["eeg"].shape[0]
+        if n_train > diagnostic_subsample_size:
+            rng = np.random.default_rng(cfg.seed)
+            diag_idx = np.sort(rng.choice(n_train, size=diagnostic_subsample_size, replace=False))
+            eeg_diag = f["eeg"][diag_idx]
+        else:
+            eeg_diag = f["eeg"][:]
 
-        print(f"Phase 4: filtering diagnostic subsample ({len(eeg_diag)} of {n_train} trials)...")
-        eeg_diag_filtered = apply_filters(eeg_diag, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                           fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-        center_full, scale_full = fit_normalization_robust(eeg_diag_filtered)
-        bad_channels = detect_bad_channels(scale_full, ac.bad_channel_scale_floor)
-        print(f"Phase 4: bad channels: {bad_channels}")
-        del eeg_diag, eeg_diag_filtered   # free the diagnostic arrays immediately
-
-        with h5py.File(train_path, "r") as f:
-            eeg_train_raw = f["eeg"][:]
-        eeg_train_raw, good_channels = exclude_channels(eeg_train_raw, bad_channels, cfg.data.n_channels_nominal)
-
-        print("Phase 4: filtering train (full set)...")
-        eeg_train_filtered = apply_filters(eeg_train_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
+    print(f"Phase 4: diagnostic pass on {len(eeg_diag)} of {n_train} trials...")
+    eeg_diag_filtered_full = apply_filters(eeg_diag, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
                                             fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-        del eeg_train_raw   # NEW: free the raw copy the moment the filtered one exists
+    center_full, scale_full = fit_normalization_robust(eeg_diag_filtered_full)
+    bad_channels = detect_bad_channels(scale_full, ac.bad_channel_scale_floor)
+    print(f"Phase 4: bad channels: {bad_channels}")
 
-        with h5py.File(val_path, "r") as f:
-            eeg_val_raw = f["eeg"][:]
-            label_binary_val = f["label_binary"][:]
-            label_digit_val = f["label_digit"][:]
-        eeg_val_raw, _ = exclude_channels(eeg_val_raw, bad_channels, cfg.data.n_channels_nominal)
+    eeg_diag, good_channels = exclude_channels(eeg_diag, bad_channels, cfg.data.n_channels_nominal)
+    eeg_diag_filtered = eeg_diag_filtered_full[:, good_channels, :]
+    del eeg_diag_filtered_full
 
-        print("Phase 4: filtering val...")
-        eeg_val_filtered = apply_filters(eeg_val_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                          fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-        del eeg_val_raw   # NEW: same reasoning, smaller benefit but free
+    center, scale = fit_normalization_robust(eeg_diag_filtered)
+    save_normalization_params(preprocessing_dir / "normalization_params.npz", center, scale)
 
-        center, scale = fit_normalization_robust(eeg_train_filtered)
-        eeg_train_norm = apply_normalization(eeg_train_filtered, center, scale)
-        eeg_val_norm = apply_normalization(eeg_val_filtered, center, scale)
-        del eeg_train_filtered, eeg_val_filtered   # NEW: free once normalized copies exist
-        save_normalization_params(preprocessing_dir / "normalization_params.npz", center, scale)
+    diag_norm = apply_normalization(eeg_diag_filtered, center, scale)
+    diag_arrays = compute_artifact_arrays(diag_norm)
+    thresholds = derive_thresholds(diag_arrays, ac.artifact_percentile, ac.flatline_percentile)
+    save_artifact_params(preprocessing_dir / "artifact_params.json", bad_channels, thresholds)
+    del eeg_diag, eeg_diag_filtered, diag_norm, diag_arrays
 
-        train_arrays = compute_artifact_arrays(eeg_train_norm)
-        val_arrays = compute_artifact_arrays(eeg_val_norm)
-        thresholds = derive_thresholds(train_arrays, ac.artifact_percentile, ac.flatline_percentile)
-        train_artifact_info = flag_artifacts(train_arrays, thresholds, ac.trial_concern_min_channels)
-        val_artifact_info = flag_artifacts(val_arrays, thresholds, ac.trial_concern_min_channels)
-        save_artifact_params(preprocessing_dir / "artifact_params.json", bad_channels, thresholds)
+    # --- Main pass: stream train and val through in chunks, never holding
+    # more than one chunk fully in memory. ---
+    print(f"\nPhase 4: processing train (chunk_size={chunk_size})...")
+    _process_split_chunked(cfg, train_path, train_filtered_path, train_features_path,
+                            bad_channels, good_channels, center, scale, thresholds, chunk_size)
+    print(f"Phase 4: wrote {train_filtered_path} and {train_features_path}")
 
-        print(f"Phase 4: train trial_concern: {train_artifact_info['trial_concern'].sum()} / {len(eeg_train_norm)}")
-        print(f"Phase 4: val trial_concern: {val_artifact_info['trial_concern'].sum()} / {len(eeg_val_norm)}")
+    print(f"\nPhase 4: processing val (chunk_size={chunk_size})...")
+    _process_split_chunked(cfg, val_path, val_filtered_path, val_features_path,
+                            bad_channels, good_channels, center, scale, thresholds, chunk_size)
+    print(f"Phase 4: wrote {val_filtered_path} and {val_features_path}")
 
-        for path, eeg, lb, ld, info in [
-            (train_filtered_path, eeg_train_norm, label_binary_train, label_digit_train, train_artifact_info),
-            (val_filtered_path, eeg_val_norm, label_binary_val, label_digit_val, val_artifact_info),
-        ]:
-            with h5py.File(path, "w") as f:
-                f.create_dataset("eeg", data=eeg, compression="gzip")
-                f.create_dataset("label_binary", data=lb)
-                f.create_dataset("label_digit", data=ld)
-                f.create_dataset("channel_indices", data=good_channels)
-                f.create_dataset("artifact_any", data=info["any"])
-                f.create_dataset("n_flagged_channels_per_trial", data=info["n_flagged_channels_per_trial"])
-                f.create_dataset("trial_concern", data=info["trial_concern"])
-        print(f"Phase 4: wrote {train_filtered_path} and {val_filtered_path}.")
-
-        _phase4_cache[cfg.data.variant_tag] = {
-            "train": eeg_train_norm, "val": eeg_val_norm,
-            "label_binary_train": label_binary_train, "label_digit_train": label_digit_train,
-            "label_binary_val": label_binary_val, "label_digit_val": label_digit_val,
-        }
-
-    _run_phase4b_features(cfg, force=force)
-
+    with h5py.File(train_filtered_path, "r") as f:
+        print(f"\nPhase 4: train trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
+    with h5py.File(val_filtered_path, "r") as f:
+        print(f"Phase 4: val trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
+        
 
 def _run_phase4b_features(cfg: PipelineConfig, force: bool = False) -> None:
     cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
