@@ -6,6 +6,7 @@ local GPU, or Colab GPU - device is passed in, never hardcoded.
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,9 +28,61 @@ class EEGDataset(Dataset):
         return self.eeg[idx], self.labels[idx]
 
 
+class LazyEEGDataset(Dataset):
+    """
+    Reads EEG trials on demand from an HDF5 file, rather than loading the
+    entire array into memory upfront. Required once the filtered dataset
+    is too large for available RAM - observed directly at 100% scale
+    (train_filtered.h5's full eeg array alone is ~13GB, before any masking
+    or training overhead, which crashed Colab's free-tier RAM outright).
+
+    indices: which rows of the HDF5 "eeg" dataset to use, AFTER trial_concern
+    and stage filtering have already been applied by the caller - this class
+    itself does no filtering, just lazy reads of whichever rows it's given.
+    """
+    def __init__(self, h5_path, indices: np.ndarray, labels: np.ndarray):
+        self.h5_path = h5_path
+        self.indices = indices
+        self.labels = torch.tensor(labels, dtype=torch.long)
+        self._file = None   # opened lazily on first access, not at construction
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        f = self._get_file()
+        row = int(self.indices[idx])
+        eeg = f["eeg"][row]   # reads ONLY this one trial from disk
+        eeg_tensor = torch.tensor(eeg, dtype=torch.float32).unsqueeze(0)
+        return eeg_tensor, self.labels[idx]
+
+    def __del__(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+
+
 def make_loaders(eeg_train, y_train, eeg_val, y_val, batch_size: int):
     train_loader = DataLoader(EEGDataset(eeg_train, y_train), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(EEGDataset(eeg_val, y_val), batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
+
+
+def make_lazy_loaders(train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val, batch_size: int):
+    """Same purpose as make_loaders, but backed by LazyEEGDataset - use
+    this when the filtered dataset is too large to load fully into RAM
+    (confirmed necessary at 100% scale)."""
+    train_loader = DataLoader(LazyEEGDataset(train_h5_path, train_indices, y_train),
+                               batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(LazyEEGDataset(val_h5_path, val_indices, y_val),
+                             batch_size=batch_size, shuffle=False)
     return train_loader, val_loader
 
 
