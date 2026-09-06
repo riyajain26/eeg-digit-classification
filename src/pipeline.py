@@ -114,19 +114,24 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
 
     total_sessions = len(set(sessionnum.tolist()))
 
+    # A single overlapping session (e.g. session 207 at 100% scale) is
+    # treated as an isolated data-source quirk, not a systemic leakage
+    # problem — excluded from train/val rather than blocking the run
+    # entirely. If overlap is large, that DOES indicate a systemic
+    # problem, so the 5% threshold below still hard-errors in that case.
     if overlap:
         overlap_fraction = len(overlap) / total_sessions
         if overlap_fraction > 0.05:
             raise RuntimeError(
                 f"Session overlap found: {overlap} ({overlap_fraction:.1%} of train pool sessions). "
-                "Too large to treat as an isolated edge case - HF's train/test boundary may not "
+                "Too large to treat as an isolated edge case — HF's train/test boundary may not "
                 "be leakage-safe overall. Resolve before proceeding (e.g. a custom 3-way split)."
             )
         print(f"Phase 3: WARNING - {len(overlap)} session(s) overlap between train pool and test "
               f"({overlap_fraction:.2%} of train sessions): {overlap}. Excluding these sessions' "
-              "trials from train/val - test remains untouched as the official held-out set.")
+              "trials from train/val — test remains untouched as the official held-out set.")
     else:
-        print("Phase 3: session overlap check passed - zero overlap.")
+        print("Phase 3: session overlap check passed — zero overlap.")
 
     trial_splits = assign_block_splits(sessionnum, blocknum, cfg.split.val_fraction, cfg.split.seed)
 
@@ -145,12 +150,9 @@ def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
     print(f"Phase 3: wrote {train_path} and {val_path}.")
 
 
-
 # ---------------------------------------------------------------------------
 # Phase 4: Preprocessing + Path A Features
 # ---------------------------------------------------------------------------
-
-_phase4_cache: dict = {}   # module-level cache: raw (channel-excluded) arrays for phase4b to reuse
 
 def _append_chunk(dset, chunk):
     old_size = dset.shape[0]
@@ -161,6 +163,12 @@ def _append_chunk(dset, chunk):
 def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path,
                              bad_channels, good_channels, center, scale, thresholds,
                              chunk_size=2000):
+    """
+    Streams a train/val split through filtering + normalization + artifact
+    flagging + feature extraction in small chunks, writing each chunk to
+    disk immediately - never holding the full split in memory. Replaces
+    the old load-everything-at-once approach, which crashed at 100% scale.
+    """
     fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
     n_good = len(good_channels)
 
@@ -184,10 +192,9 @@ def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path
 
             for start in range(0, n_total, chunk_size):
                 end = min(start + chunk_size, n_total)
-                eeg_chunk = src["eeg"][start:end]   # contiguous slice - efficient, only this chunk in memory
+                eeg_chunk = src["eeg"][start:end]
                 eeg_chunk, _ = exclude_channels(eeg_chunk, bad_channels, cfg.data.n_channels_nominal)
 
-                # Path B: filter -> normalize (reusing pre-fit center/scale) -> flag
                 filtered_chunk = apply_filters(eeg_chunk, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
                                                 fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
                 norm_chunk = apply_normalization(filtered_chunk, center, scale)
@@ -201,8 +208,6 @@ def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path
                 _append_chunk(nflag_ds, flags_chunk["n_flagged_channels_per_trial"])
                 _append_chunk(concern_ds, flags_chunk["trial_concern"])
 
-                # Path A: features on RAW (channel-excluded, unfiltered) chunk -
-                # same underlying data read, no second pass through the source file
                 features_chunk = extract_features_batch(eeg_chunk, fs, cfg.feature.eeg_bands, cfg.feature.welch_nperseg)
                 if feat_ds is None:
                     n_feat = features_chunk.shape[1]
@@ -221,6 +226,14 @@ def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path
 
 def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
                                diagnostic_subsample_size: int = 25000, chunk_size: int = 2000) -> None:
+    """
+    diagnostic_subsample_size: trials used to fit bad-channel detection,
+    normalization, and artifact thresholds. Raised from an earlier 5000 to
+    25000 for better coverage of rare artifact patterns, while staying
+    small enough to avoid memory issues.
+    chunk_size: trials processed at once during the main pass - keeps peak
+    memory roughly constant regardless of total dataset size.
+    """
     cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
     cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
     preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
@@ -240,9 +253,6 @@ def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
     val_path = cfg.data.splits_dir / "val.h5"
     fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
 
-    # --- Diagnostic pass: fit everything (bad channels, normalization,
-    # artifact thresholds) from ONE small subsample - the only data held
-    # fully in memory at any point. ---
     with h5py.File(train_path, "r") as f:
         n_train = f["eeg"].shape[0]
         if n_train > diagnostic_subsample_size:
@@ -272,8 +282,6 @@ def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
     save_artifact_params(preprocessing_dir / "artifact_params.json", bad_channels, thresholds)
     del eeg_diag, eeg_diag_filtered, diag_norm, diag_arrays
 
-    # --- Main pass: stream train and val through in chunks, never holding
-    # more than one chunk fully in memory. ---
     print(f"\nPhase 4: processing train (chunk_size={chunk_size})...")
     _process_split_chunked(cfg, train_path, train_filtered_path, train_features_path,
                             bad_channels, good_channels, center, scale, thresholds, chunk_size)
@@ -351,26 +359,37 @@ def _load_stage_data_classical(cfg: PipelineConfig):
     return X_train[keep_train], y_train, X_val[keep_val], y_val, average
 
 
-def _load_stage_data_deep(cfg: PipelineConfig):
-    """Loads Path B filtered raw EEG, applies trial_concern exclusion, and
-    filters to digit-only trials if stage2. Returns (eeg_train, y_train, eeg_val, y_val)."""
-    with h5py.File(cfg.data.filtered_dir / "train_filtered.h5", "r") as f:
-        eeg_train, y_bin_train, y_digit_train = f["eeg"][:], f["label_binary"][:], f["label_digit"][:]
+def _load_stage_data_deep_lazy(cfg: PipelineConfig):
+    """
+    Returns (train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val)
+    instead of full in-memory arrays - only labels and trial_concern flags
+    (small) are loaded; the actual EEG data stays on disk and is read
+    per-trial by LazyEEGDataset during training. Required at 100% scale,
+    where the full filtered eeg array (~13GB) crashed Colab outright.
+    """
+    train_path = cfg.data.filtered_dir / "train_filtered.h5"
+    val_path = cfg.data.filtered_dir / "val_filtered.h5"
+
+    with h5py.File(train_path, "r") as f:
+        y_bin_train = f["label_binary"][:]
+        y_digit_train = f["label_digit"][:]
         train_concern = f["trial_concern"][:]
-    with h5py.File(cfg.data.filtered_dir / "val_filtered.h5", "r") as f:
-        eeg_val, y_bin_val, y_digit_val = f["eeg"][:], f["label_binary"][:], f["label_digit"][:]
+    with h5py.File(val_path, "r") as f:
+        y_bin_val = f["label_binary"][:]
+        y_digit_val = f["label_digit"][:]
         val_concern = f["trial_concern"][:]
 
     keep_train, keep_val = ~train_concern, ~val_concern
-
     if cfg.model.stage == "stage2":
         keep_train &= (y_digit_train != -1)
         keep_val &= (y_digit_val != -1)
-        y_train, y_val = y_digit_train[keep_train], y_digit_val[keep_val]
+        y_train_full, y_val_full = y_digit_train, y_digit_val
     else:
-        y_train, y_val = y_bin_train[keep_train], y_bin_val[keep_val]
+        y_train_full, y_val_full = y_bin_train, y_bin_val
 
-    return eeg_train[keep_train], y_train, eeg_val[keep_val], y_val
+    train_indices = np.where(keep_train)[0]
+    val_indices = np.where(keep_val)[0]
+    return train_path, train_indices, y_train_full[train_indices], val_path, val_indices, y_val_full[val_indices]
 
 
 def _save_results(cfg: PipelineConfig, results: dict) -> None:
@@ -453,23 +472,27 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     # Deferred import: torch is only required when a deep model is actually
     # selected, so classical-only usage of this package never needs it installed.
     import torch
-    from src.training.loop import (make_loaders, train_with_checkpointing, train_stage2_path_b2,
-                                     run_epoch, EEGDataset)
+    from src.training.loop import (make_lazy_loaders, train_with_checkpointing, train_stage2_path_b2,
+                                     run_epoch, LazyEEGDataset, EEGDataset)
     from torch.utils.data import DataLoader
     import torch.nn as nn
 
-    eeg_train, y_train, eeg_val, y_val = _load_stage_data_deep(cfg)
-    n_channels, n_samples = eeg_train.shape[1], eeg_train.shape[2]
+    train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val = _load_stage_data_deep_lazy(cfg)
+
+    with h5py.File(train_h5_path, "r") as f:
+        n_channels, n_samples = f["eeg"].shape[1], f["eeg"].shape[2]
+
     n_classes = 2 if cfg.model.stage == "stage1" else 10
     is_stage2 = cfg.model.stage == "stage2"
     variant = cfg.model.stage2.variant if is_stage2 else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     label = f"{cfg.model.stage}/{cfg.model.model_name}" + (f"/{variant}" if variant else "")
-    print(f"Phase 6 [{label}]: using device {device}")
+    print(f"Phase 6 [{label}]: using device {device}, train={len(train_indices)}, val={len(val_indices)} trials")
     torch.manual_seed(cfg.seed)
 
-    train_loader, val_loader = make_loaders(eeg_train, y_train, eeg_val, y_val, cfg.training.batch_size)
+    train_loader, val_loader = make_lazy_loaders(train_h5_path, train_indices, y_train,
+                                                   val_h5_path, val_indices, y_val, cfg.training.batch_size)
 
     if is_stage2:
         stage1_ckpt = _stage1_eegnet_checkpoint_path(cfg)
@@ -522,12 +545,19 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     permutation_result = None
     if run_permutation:
         print("Running (reduced-scale) permutation test...")
-        # Deliberately uses a FRESH model (Path A style) for the permutation
-        # harness regardless of which variant is being evaluated (same
-        # surrogate-model principle as the SVM permutation fix) - repeating
-        # B2's two-phase procedure or Path C's dual-backbone construction for
-        # every shuffled run would be prohibitively expensive for what's only
-        # meant to be a rough noise-floor check.
+        # Reads ONLY the permutation subsample's rows from disk (h5py fancy
+        # indexing), never the full train array - same lazy principle as
+        # the main training loop, just a smaller in-memory-safe subsample
+        # since permutation testing is already deliberately reduced-scale.
+        rng = np.random.default_rng(cfg.seed)
+        perm_size = min(cfg.permutation.deep_subsample_size, len(train_indices))
+        perm_idx_into_indices = rng.choice(len(train_indices), size=perm_size, replace=False)
+        perm_rows = np.sort(train_indices[perm_idx_into_indices])
+        y_perm = y_train[np.searchsorted(train_indices, perm_rows)]
+
+        with h5py.File(train_h5_path, "r") as f:
+            eeg_perm_sub = f["eeg"][perm_rows]
+
         def train_fn(eeg_sub, y_sub):
             m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
             opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
@@ -548,9 +578,9 @@ def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
             return accuracy_score(labels, preds)
 
         real_acc, shuffled_accs = permutation_test_torch(
-            train_fn, eval_fn, eeg_train, y_train, val_loader,
+            train_fn, eval_fn, eeg_perm_sub, y_perm, val_loader,
             n_permutations=cfg.permutation.n_permutations_deep,
-            subsample_size=cfg.permutation.deep_subsample_size, seed=cfg.seed,
+            subsample_size=perm_size, seed=cfg.seed,
         )
         gap = real_acc - shuffled_accs.mean()
         permutation_result = {
@@ -682,18 +712,23 @@ def _load_test_data_classical(cfg: PipelineConfig):
     return X_test[keep], y_test, average
 
 
-def _load_test_data_deep(cfg: PipelineConfig):
-    with h5py.File(cfg.data.filtered_dir / "test_filtered.h5", "r") as f:
-        eeg_test, y_bin_test, y_digit_test = f["eeg"][:], f["label_binary"][:], f["label_digit"][:]
+def _load_test_data_deep_lazy(cfg: PipelineConfig):
+    """Same lazy pattern as _load_stage_data_deep_lazy - test set at 100%
+    is no longer capped either (test_target_per_class becomes None), so
+    it's worth the same treatment rather than assuming it's always small."""
+    test_path = cfg.data.filtered_dir / "test_filtered.h5"
+    with h5py.File(test_path, "r") as f:
+        y_bin_test = f["label_binary"][:]
+        y_digit_test = f["label_digit"][:]
         test_concern = f["trial_concern"][:]
-
     keep = ~test_concern
     if cfg.model.stage == "stage2":
         keep &= (y_digit_test != -1)
-        y_test = y_digit_test[keep]
+        y_test_full = y_digit_test
     else:
-        y_test = y_bin_test[keep]
-    return eeg_test[keep], y_test
+        y_test_full = y_bin_test
+    test_indices = np.where(keep)[0]
+    return test_path, test_indices, y_test_full[test_indices]
 
 
 def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
@@ -712,8 +747,12 @@ def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
 
     if cfg.model.is_deep:
         import torch
-        eeg_test, y_test = _load_test_data_deep(cfg)
-        n_channels, n_samples = eeg_test.shape[1], eeg_test.shape[2]
+        from torch.utils.data import DataLoader
+        from src.training.loop import LazyEEGDataset
+
+        test_path, test_indices, y_test = _load_test_data_deep_lazy(cfg)
+        with h5py.File(test_path, "r") as f:
+            n_channels, n_samples = f["eeg"].shape[1], f["eeg"].shape[2]
         n_classes = 2 if cfg.model.stage == "stage1" else 10
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -726,9 +765,8 @@ def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         model.eval()
 
-        from torch.utils.data import DataLoader
-        from src.training.loop import EEGDataset
-        loader = DataLoader(EEGDataset(eeg_test, y_test), batch_size=cfg.training.batch_size, shuffle=False)
+        loader = DataLoader(LazyEEGDataset(test_path, test_indices, y_test),
+                             batch_size=cfg.training.batch_size, shuffle=False)
 
         all_preds, all_labels = [], []
         with torch.no_grad():
@@ -778,16 +816,23 @@ def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 def main(
-        dataset_variant: str = "2B", 
-        subsample_fraction: float = 0.20, 
-        stage: str = "stage1",
-        model_name: str = "random_forest", 
-        stage2_variant: str = "path_a",
-        seed: int = 42, 
-        force: bool = False) -> dict:
+    dataset_variant: str = "2B",
+    subsample_fraction: float = 0.20,
+    stage: str = "stage1",
+    model_name: str = "random_forest",
+    stage2_variant: str = "path_a",
+    seed: int = 42,
+    force: bool = False,
+) -> dict:
+    """
+    The intended way to run this pipeline: set these parameters, get a
+    fully-processed dataset and a trained, evaluated model back. Everything
+    else - paths, HF repo id, trial counts, which training code path runs -
+    is derived automatically from these.
+    """
     cfg = build_config(dataset_variant, subsample_fraction, stage, model_name, stage2_variant, seed)
     print(f"=== dataset_variant={dataset_variant!r} subsample_fraction={subsample_fraction} "
-          f"stage={stage!r} model={model_name!r} ===")
+          f"stage={stage!r} model={model_name!r} stage2_variant={stage2_variant!r} ===")
 
     run_phase2_data_acquisition(cfg, force=force)
     run_phase3_splitting(cfg, force=force)

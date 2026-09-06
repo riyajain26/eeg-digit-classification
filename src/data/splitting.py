@@ -58,14 +58,29 @@ def validate_split(sessionnum, blocknum, trial_splits: np.ndarray) -> dict:
     }
 
 
-def materialize_split(source_path: Path, trial_splits: np.ndarray, output_paths: dict[str, Path]) -> None:
+def materialize_split(
+    source_path: Path,
+    trial_splits: np.ndarray,
+    output_paths: dict[str, Path],
+) -> None:
+    """
+    Writes separate output files per split (not a shared file + mask) — for
+    faster reads and to make mixing splits structurally impossible later.
+
+    Reads ONLY the rows belonging to each split (h5py fancy indexing),
+    rather than loading the full source dataset into memory first — the
+    old `src[key][:][mask]` pattern read the ENTIRE eeg array from disk
+    once per split (twice total for train+val), which at 100% scale is
+    ~15.7GB per read and was the direct cause of a Phase 3 OOM crash.
+    """
     with h5py.File(source_path, "r") as src:
         keys = list(src.keys())
+
         for split_name, out_path in output_paths.items():
-            idx = np.where(trial_splits == split_name)[0]   # always ascending - required for h5py fancy indexing
+            idx = np.where(trial_splits == split_name)[0]   # ascending order, required for h5py fancy indexing
             with h5py.File(out_path, "w") as dst:
                 for key in keys:
                     dst.create_dataset(
-                        key, data=src[key][idx],   # reads ONLY these rows from disk, not the full array
+                        key, data=src[key][idx],
                         compression="gzip" if key == "eeg" else None,
                     )
