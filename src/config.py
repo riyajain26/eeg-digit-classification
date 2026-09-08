@@ -6,15 +6,15 @@ the user should only ever need to set a handful of top-level parameters,
 and every path, count, and derived value follows automatically. Nothing
 below should ever need hand-editing to change dataset scale.
 
-BUILD STATUS - Step 1 of modularization (data acquisition + train/val
-split) only. This file currently defines:
+BUILD STATUS - Steps 1-2 of modularization (data acquisition + train/val
+split, then preprocessing) done. This file currently defines:
   - DATASET_VARIANTS / DataConfig: dataset scale + derived paths
   - SplitConfig: train/val split parameters
-  - PipelineConfig / build_config(): wiring for the above two
+  - FilterConfig / ArtifactConfig / NormalizationConfig: preprocessing
+    variant selection + that variant's parameters
+  - PipelineConfig / build_config(): wiring for all of the above
 
 Later steps will ADD to this same file (not replace it):
-  - Step 2 (preprocessing): FilterConfig, ArtifactConfig, plus variant
-    fields for filter/artifact-detection strategy
   - Step 3 (features): FeatureConfig, plus a feature-extraction variant field
   - Step 4 (models): ModelConfig and everything under it
   - Step 5+ (training/evaluation): TrainingConfig, PermutationTestConfig
@@ -176,6 +176,25 @@ class DataConfig:
         own outputs to their own directories."""
         return self.data_root / "processed" / self.variant_tag / "splits"
 
+    @property
+    def filtered_dir(self) -> Path:
+        """Where preprocessing (filter + normalize + artifact-flag)
+        writes its train/val output. Added in Step 2."""
+        return self.data_root / "processed" / self.variant_tag / "filtered"
+
+    @property
+    def preprocessing_params_dir(self) -> Path:
+        """Where fitted preprocessing params (normalization center/scale,
+        bad channels, artifact thresholds) are saved.
+
+        Deliberately scoped by data variant + preprocessing variant choice
+        ONLY - not by model. The original codebase nested this under model
+        config (`cfg.model.preprocessing_dir`), which doesn't reflect
+        reality: these fitted params don't depend on which model will
+        later consume the resulting features, so a model-scoped path
+        would need needlessly re-fitting the same preprocessing per model."""
+        return self.data_root / "processed" / self.variant_tag / "preprocessing_params"
+
 
 @dataclass
 class SplitConfig:
@@ -185,16 +204,54 @@ class SplitConfig:
 
 
 @dataclass
+class FilterConfig:
+    """Selects + parameterizes a filtering variant (see
+    src/preprocessing/filters.py). variant must be a name registered in
+    FILTER_REGISTRY; the rest of the fields are that variant's own
+    parameters - a different variant might not use all (or any) of them."""
+    variant: str = "butterworth_bandpass"
+    bandpass_low_hz: float = 1.0
+    bandpass_high_hz: float = 40.0
+    notch_freq_hz: float = 60.0
+    apply_notch: bool = False
+    filter_order: int = 4
+
+
+@dataclass
+class ArtifactConfig:
+    """Selects + parameterizes an artifact-detection variant (see
+    src/preprocessing/artifacts.py). variant must be a name registered in
+    ARTIFACT_REGISTRY."""
+    variant: str = "percentile_multi_criteria"
+    artifact_percentile: float = 99.5
+    flatline_percentile: float = 0.5
+    trial_concern_min_channels: int = 3
+    bad_channel_scale_floor: float = 1e-7
+
+
+@dataclass
+class NormalizationConfig:
+    """Selects a normalization variant (see
+    src/preprocessing/normalization.py). variant must be a name registered
+    in NORMALIZATION_REGISTRY. No tunable parameters yet - the current
+    variant (median/MAD) is parameterless; a future variant might add some."""
+    variant: str = "robust_median_mad"
+
+
+@dataclass
 class PipelineConfig:
     """
     Top-level config object, built by build_config(). Currently wires
-    together DataConfig and SplitConfig only (Step 1 of modularization) -
-    later steps will add their own dataclass fields here (filter, artifact,
-    feature, model, training, permutation), matching the pattern already
-    used for data/split.
+    together data/split/filter/artifact/normalization (Steps 1-2 of
+    modularization) - later steps will add their own dataclass fields
+    here (feature, model, training, permutation), matching the pattern
+    already used for these five.
     """
     data: DataConfig = field(default_factory=DataConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
+    filter: FilterConfig = field(default_factory=FilterConfig)
+    artifact: ArtifactConfig = field(default_factory=ArtifactConfig)
+    normalization: NormalizationConfig = field(default_factory=NormalizationConfig)
     seed: int = 42   # top-level seed; split.seed mirrors this by default via build_config()
 
 
@@ -202,22 +259,35 @@ def build_config(
     dataset_variant: str = "2B",
     subsample_fraction: float = 0.20,
     seed: int = 42,
+    filter_variant: str = "butterworth_bandpass",
+    artifact_variant: str = "percentile_multi_criteria",
+    normalization_variant: str = "robust_median_mad",
 ) -> PipelineConfig:
     """
     The intended entry point for users: set these parameters, get back a
     fully-wired config. Everything else (paths, trial counts, HF repo id)
     derives automatically.
 
-    NOTE: this signature will grow as later modularization steps add their
-    own config sections (preprocessing/feature/model variants) - each new
-    parameter will have a sensible default, so existing calls to
-    build_config() keep working unchanged as the pipeline grows.
+    The three *_variant parameters select which registered function/
+    strategy each pluggable preprocessing step uses (see
+    src/preprocessing/*.py) - each defaults to the only variant that
+    currently exists, so existing calls to build_config() don't need to
+    change as more variants are added. Finer per-variant parameters (e.g.
+    cfg.filter.bandpass_low_hz) aren't build_config() arguments - set
+    them directly on the returned config if you need non-default values.
+
+    NOTE: this signature will grow further as later modularization steps
+    (features, models) add their own variant fields, following the same
+    pattern.
     """
     cfg = PipelineConfig()
     cfg.data.dataset_variant = dataset_variant
     cfg.data.subsample_fraction = subsample_fraction
     cfg.seed = seed
     cfg.split.seed = seed
+    cfg.filter.variant = filter_variant
+    cfg.artifact.variant = artifact_variant
+    cfg.normalization.variant = normalization_variant
     return cfg
 
 

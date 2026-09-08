@@ -18,6 +18,7 @@ import argparse
 
 import h5py
 
+import _bootstrap  # noqa: F401  (adds project root to sys.path - must come before the `src` imports below)
 from src.config import build_config
 from src.steps.data_preparation import run_data_preparation
 
