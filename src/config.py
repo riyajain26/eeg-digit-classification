@@ -6,16 +6,16 @@ the user should only ever need to set a handful of top-level parameters,
 and every path, count, and derived value follows automatically. Nothing
 below should ever need hand-editing to change dataset scale.
 
-BUILD STATUS - Steps 1-2 of modularization (data acquisition + train/val
-split, then preprocessing) done. This file currently defines:
+BUILD STATUS - Steps 1-3 of modularization (data acquisition + split,
+preprocessing, features) done. This file currently defines:
   - DATASET_VARIANTS / DataConfig: dataset scale + derived paths
   - SplitConfig: train/val split parameters
   - FilterConfig / ArtifactConfig / NormalizationConfig: preprocessing
     variant selection + that variant's parameters
+  - FeatureConfig: feature-extraction variant selection + parameters
   - PipelineConfig / build_config(): wiring for all of the above
 
 Later steps will ADD to this same file (not replace it):
-  - Step 3 (features): FeatureConfig, plus a feature-extraction variant field
   - Step 4 (models): ModelConfig and everything under it
   - Step 5+ (training/evaluation): TrainingConfig, PermutationTestConfig
 Each addition follows the same shape as what's here: a dataclass for that
@@ -195,6 +195,14 @@ class DataConfig:
         would need needlessly re-fitting the same preprocessing per model."""
         return self.data_root / "processed" / self.variant_tag / "preprocessing_params"
 
+    @property
+    def features_dir(self) -> Path:
+        """Where extracted features (train_features.h5 / val_features.h5)
+        live. Added in Step 3. Computed from Step 1's RAW split output
+        (splits_dir), not Step 2's filtered output - see
+        src/features/extraction.py's module docstring for why."""
+        return self.data_root / "processed" / self.variant_tag / "features"
+
 
 @dataclass
 class SplitConfig:
@@ -239,19 +247,34 @@ class NormalizationConfig:
 
 
 @dataclass
+class FeatureConfig:
+    """Selects + parameterizes a feature-extraction variant (see
+    src/features/extraction.py). variant must be a name registered in
+    FEATURE_REGISTRY; the rest of the fields are that variant's own
+    parameters."""
+    variant: str = "band_power_stat_freq"
+    eeg_bands: dict = field(default_factory=lambda: {
+        "delta": (1, 4), "theta": (4, 8), "alpha": (8, 13),
+        "beta": (13, 30), "gamma": (30, 40), "high_gamma": (40, 80),
+    })
+    welch_nperseg: int = 128
+
+
+@dataclass
 class PipelineConfig:
     """
     Top-level config object, built by build_config(). Currently wires
-    together data/split/filter/artifact/normalization (Steps 1-2 of
-    modularization) - later steps will add their own dataclass fields
-    here (feature, model, training, permutation), matching the pattern
-    already used for these five.
+    together data/split/filter/artifact/normalization/feature (Steps 1-3
+    of modularization) - later steps will add their own dataclass fields
+    here (model, training, permutation), matching the pattern already
+    used for these six.
     """
     data: DataConfig = field(default_factory=DataConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     filter: FilterConfig = field(default_factory=FilterConfig)
     artifact: ArtifactConfig = field(default_factory=ArtifactConfig)
     normalization: NormalizationConfig = field(default_factory=NormalizationConfig)
+    feature: FeatureConfig = field(default_factory=FeatureConfig)
     seed: int = 42   # top-level seed; split.seed mirrors this by default via build_config()
 
 
@@ -262,23 +285,24 @@ def build_config(
     filter_variant: str = "butterworth_bandpass",
     artifact_variant: str = "percentile_multi_criteria",
     normalization_variant: str = "robust_median_mad",
+    feature_variant: str = "band_power_stat_freq",
 ) -> PipelineConfig:
     """
     The intended entry point for users: set these parameters, get back a
     fully-wired config. Everything else (paths, trial counts, HF repo id)
     derives automatically.
 
-    The three *_variant parameters select which registered function/
-    strategy each pluggable preprocessing step uses (see
-    src/preprocessing/*.py) - each defaults to the only variant that
+    The *_variant parameters select which registered function/strategy
+    each pluggable step uses (see src/preprocessing/*.py,
+    src/features/extraction.py) - each defaults to the only variant that
     currently exists, so existing calls to build_config() don't need to
     change as more variants are added. Finer per-variant parameters (e.g.
-    cfg.filter.bandpass_low_hz) aren't build_config() arguments - set
-    them directly on the returned config if you need non-default values.
+    cfg.filter.bandpass_low_hz, cfg.feature.eeg_bands) aren't build_config()
+    arguments - set them directly on the returned config if you need
+    non-default values.
 
     NOTE: this signature will grow further as later modularization steps
-    (features, models) add their own variant fields, following the same
-    pattern.
+    (models) add their own variant fields, following the same pattern.
     """
     cfg = PipelineConfig()
     cfg.data.dataset_variant = dataset_variant
@@ -288,6 +312,7 @@ def build_config(
     cfg.filter.variant = filter_variant
     cfg.artifact.variant = artifact_variant
     cfg.normalization.variant = normalization_variant
+    cfg.feature.variant = feature_variant
     return cfg
 
 
