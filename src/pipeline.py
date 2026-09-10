@@ -1,7 +1,9 @@
 """
 Full pipeline: chains Steps 1-4 into one entry point.
 
-run_pipeline(cfg) calls, in order:
+run_pipeline(cfg) calls, in order, SKIPPING any step whose output already
+exists (checked from the end backwards - see run_pipeline's docstring for
+why that direction matters):
   1. run_data_preparation(cfg)   [src/steps/data_preparation.py]
   2. run_preprocessing(cfg)      [src/steps/preprocessing.py]
   3. run_features(cfg)           [src/steps/features.py] - ONLY when
@@ -84,13 +86,39 @@ def run_pipeline(cfg: PipelineConfig, force: bool = False, run_permutation: bool
     Runs every step needed to go from nothing to a trained, evaluated
     model, for whatever cfg.model.task/model_name selects. This is the
     ONE function scripts/run_pipeline.py calls.
+
+    Checks outputs from the END backwards, not just forwards: if
+    preprocessing's output already exists, data preparation is skipped
+    too, even though data preparation's OWN intermediate files
+    (interim/train_pool.h5, splits/test.h5) might be missing - e.g. if
+    only the filtered/features folders were uploaded from elsewhere,
+    without the raw intermediate splits. Without this check, a pre-existing
+    filtered/features output would still get ignored and everything would
+    get re-streamed from Hugging Face from scratch for no reason, purely
+    because an EARLIER step's own output happened to be absent - which is
+    exactly the bug this replaced (run_data_preparation()'s own skip logic
+    only ever looks at ITS OWN files, so it had no way to know Step 2/3
+    had already made it unnecessary).
     """
     _ensure_reuse_source_trained(cfg, force=force, run_permutation=run_permutation)
 
-    run_data_preparation(cfg, force=force)
-    run_preprocessing(cfg, force=force)
+    filtered_ready = ((cfg.data.filtered_dir / "train_filtered.h5").exists()
+                       and (cfg.data.filtered_dir / "val_filtered.h5").exists())
+
+    if force or not filtered_ready:
+        run_data_preparation(cfg, force=force)
+        run_preprocessing(cfg, force=force)
+    else:
+        print("Pipeline: preprocessing output already present - skipping data preparation and preprocessing.")
+
     if not cfg.model.is_deep:
-        run_features(cfg, force=force)
+        features_ready = ((cfg.data.features_dir / "train_features.h5").exists()
+                           and (cfg.data.features_dir / "val_features.h5").exists())
+        if force or not features_ready:
+            run_features(cfg, force=force)
+        else:
+            print("Pipeline: feature output already present - skipping feature extraction.")
+
     return run_model_training(cfg, run_permutation=run_permutation)
 
 
