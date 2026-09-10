@@ -1,16 +1,19 @@
 """
 Permutation-test (shuffled-label) harnesses - the floor every real model
-result must clear before being trusted (Notebook 03, Section 6; extended
-for deep models in Notebook 06, Section 7).
+result must clear before being trusted.
 
 Two versions, since classical (sklearn) and deep (PyTorch) models have
 different training APIs:
 - permutation_test_sklearn: general-purpose, works with any sklearn-style
-  estimator (fit/predict), used at full scale.
+  estimator (fit/predict).
 - permutation_test_torch: deep-model version, deliberately cheaper (fewer
   epochs, smaller subsample, fewer permutations) given per-run training
   cost - a directional check, not a precise one. Bump the parameters up if
   compute allows a more rigorous version.
+
+No registry here: which harness to use is determined entirely by
+is_deep (see src/models/factory.py's MODEL_REGISTRY), not an independent
+choice - there's nothing to select between beyond that.
 """
 
 from typing import Callable

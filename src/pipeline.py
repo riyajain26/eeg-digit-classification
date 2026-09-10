@@ -1,848 +1,123 @@
 """
-End-to-end orchestration, phase numbers matching roadmap.md:
-Phase 2 (data acquisition) -> Phase 3 (splitting) -> Phase 4 (preprocessing
-+ Path A features) -> Phase 5/6 (train + evaluate whichever model was
-selected, classical or deep) + permutation test.
+Full pipeline: chains Steps 1-4 into one entry point.
 
-This file contains NO algorithm logic of its own - it only calls into
-data/, preprocessing/, features/, models/, training/, and evaluation/, in
-the right order, with the right arguments, based on the config produced by
-build_config().
+run_pipeline(cfg) calls, in order:
+  1. run_data_preparation(cfg)   [src/steps/data_preparation.py]
+  2. run_preprocessing(cfg)      [src/steps/preprocessing.py]
+  3. run_features(cfg)           [src/steps/features.py] - ONLY when
+     cfg.model.is_deep is False. Deep models read filtered EEG directly
+     and never touch features (see src/steps/features.py's module
+     docstring) - running this step for a deep-only run would just burn
+     time computing something nothing downstream reads.
+  4. run_model_training(cfg)     [src/steps/models.py]
 
-Scaling/staging/model-selection philosophy (per project decision):
-- Changing dataset scale = change subsample_fraction. No code below branches
-  on scale explicitly - it's entirely handled by config.py's derived paths
-  and target_per_class.
-- Adding Stage 2 = change stage. Only _load_stage_data() branches on it -
-  every phase before modeling is stage-agnostic (processes ALL trials the
-  same way regardless of which stage will eventually consume them).
-- Switching models = change model_name. Only the model-training phase
-  branches on cfg.model.is_deep - phases 2-4 never reference model_name at all.
+Plus one genuinely new piece: if the selected model needs a backbone
+reused from another task (any *_backbone_reuse/_auxiliary_input model)
+and that source checkpoint doesn't exist yet, it's trained first,
+automatically, as a nested run_pipeline() call for the source task's
+eegnet_fresh - so running e.g. eegnet_frozen_backbone_reuse cold, with no
+prior binary-task run, just works rather than raising and telling you to
+go run a separate command first.
+
+Also provides prompt_for_variants(cfg), the interactive-selection piece.
+This lives HERE, not in config.py, because it needs to read the actual
+registries (FILTER_REGISTRY, MODEL_REGISTRY, etc.) to show valid options -
+and config.py deliberately never imports from src.preprocessing/src.models/
+etc (see config.py's own comment on why: avoiding a circular import).
+build_config() itself never prompts; only scripts/run_pipeline.py's
+--interactive flag calls this.
 """
 
-from pathlib import Path
+import copy
 
-import h5py
-import joblib
-import json
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from src.config import CLASSICAL_MODEL_NAMES, DEEP_MODEL_NAMES, ModelConfig, PipelineConfig, TASK_INFO
+from src.steps.data_preparation import run_data_preparation
+from src.steps.features import run_features
+from src.steps.models import run_model_training
+from src.steps.preprocessing import run_preprocessing
 
-from src.config import PipelineConfig, ModelConfig, build_config
-from src.data.conversion import extract_split
-from src.data.splitting import (check_session_overlap, assign_block_splits,
-                                  validate_split, materialize_split)
-from src.preprocessing.filters import apply_filters
-from src.preprocessing.normalization import (fit_normalization_robust, apply_normalization,
-                                                save_normalization_params, load_normalization_params)
-from src.preprocessing.artifacts import (detect_bad_channels, exclude_channels,
-                                            compute_artifact_arrays, derive_thresholds,
-                                            flag_artifacts, save_artifact_params, load_artifact_params)
-from src.features.extraction import extract_features_batch
-from src.models.factory import (build_classical_model, build_classical_model_for_permutation,
-                                  build_eegnet, build_stage2_eegnet)
-from src.evaluation.metrics import evaluate_sklearn_model, compute_classification_metrics
-from src.evaluation.permutation_test import permutation_test_sklearn, permutation_test_torch
+REUSE_MODEL_NAMES = {
+    "eegnet_frozen_backbone_reuse",
+    "eegnet_finetuned_backbone_reuse",
+    "eegnet_dual_backbone_auxiliary_input",
+}
 
 
-def _exists(path: Path) -> bool:
-    return path.exists()
+def _ensure_reuse_source_trained(cfg: PipelineConfig, force: bool, run_permutation: bool) -> None:
+    """
+    If cfg.model.model_name is one of the backbone-reuse variants and its
+    source task's eegnet_fresh checkpoint doesn't exist yet, trains it
+    first via a nested run_pipeline() call.
 
-
-# ---------------------------------------------------------------------------
-# Phase 2: Data Acquisition (HF streaming happens inside extract_split, below)
-# ---------------------------------------------------------------------------
-
-def run_phase2_data_acquisition(cfg: PipelineConfig, force: bool = False) -> None:
-    cfg.data.interim_dir.mkdir(parents=True, exist_ok=True)
-    cfg.data.splits_dir.mkdir(parents=True, exist_ok=True)
-
-    train_pool_path = cfg.data.interim_dir / "train_pool.h5"
-    if force or not _exists(train_pool_path):
-        print(f"Phase 2 [{cfg.data.variant_tag}]: extracting train pool "
-              f"(target_per_class={cfg.data.target_per_class})...")
-        counts = extract_split(
-            output_path=train_pool_path,
-            hf_dataset_name=cfg.data.hf_dataset_name,
-            hf_split="train",
-            target_per_class=cfg.data.target_per_class,
-            n_channels=cfg.data.n_channels_nominal,
-            n_samples=cfg.data.n_samples,
-            max_stream_multiplier=cfg.data.max_stream_multiplier,
-        )
-        print(f"Train pool counts: {counts}")
-    else:
-        print(f"Phase 2: train pool already exists at {train_pool_path}, skipping.")
-
-    test_path = cfg.data.splits_dir / "test.h5"
-    if force or not _exists(test_path):
-        print(f"Phase 2 [{cfg.data.variant_tag}]: extracting test set "
-              f"(target_per_class={cfg.data.test_target_per_class})...")
-        counts = extract_split(
-            output_path=test_path,
-            hf_dataset_name=cfg.data.hf_dataset_name,
-            hf_split="test",
-            target_per_class=cfg.data.test_target_per_class,
-            n_channels=cfg.data.n_channels_nominal,
-            n_samples=cfg.data.n_samples,
-            max_stream_multiplier=cfg.data.max_stream_multiplier,
-        )
-        print(f"Test set counts: {counts}")
-    else:
-        print(f"Phase 2: test set already exists at {test_path}, skipping.")
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Leakage-Safe Splitting
-# ---------------------------------------------------------------------------
-
-def run_phase3_splitting(cfg: PipelineConfig, force: bool = False) -> None:
-    train_path = cfg.data.splits_dir / "train.h5"
-    val_path = cfg.data.splits_dir / "val.h5"
-
-    if not force and _exists(train_path) and _exists(val_path):
-        print("Phase 3: train/val splits already exist, skipping.")
+    Can only recurse one level deep: the nested call always uses
+    model_name="eegnet_fresh", which is never itself in REUSE_MODEL_NAMES -
+    so its own _ensure_reuse_source_trained() call immediately returns,
+    with no explicit recursion guard needed.
+    """
+    if cfg.model.model_name not in REUSE_MODEL_NAMES:
         return
 
-    train_pool_path = cfg.data.interim_dir / "train_pool.h5"
-    test_path = cfg.data.splits_dir / "test.h5"
+    source_task = cfg.model.eegnet.reuse_source_task
+    source_model_cfg = ModelConfig(model_name="eegnet_fresh", task=source_task, model_root=cfg.model.model_root)
+    checkpoint_path = source_model_cfg.checkpoint_path(cfg.data.variant_tag)
 
-    overlap = check_session_overlap(train_pool_path, test_path)
-    with h5py.File(train_pool_path, "r") as f:
-        sessionnum, blocknum = f["sessionnum"][:], f["blocknum"][:]
-
-    total_sessions = len(set(sessionnum.tolist()))
-
-    # A single overlapping session (e.g. session 207 at 100% scale) is
-    # treated as an isolated data-source quirk, not a systemic leakage
-    # problem — excluded from train/val rather than blocking the run
-    # entirely. If overlap is large, that DOES indicate a systemic
-    # problem, so the 5% threshold below still hard-errors in that case.
-    if overlap:
-        overlap_fraction = len(overlap) / total_sessions
-        if overlap_fraction > 0.05:
-            raise RuntimeError(
-                f"Session overlap found: {overlap} ({overlap_fraction:.1%} of train pool sessions). "
-                "Too large to treat as an isolated edge case — HF's train/test boundary may not "
-                "be leakage-safe overall. Resolve before proceeding (e.g. a custom 3-way split)."
-            )
-        print(f"Phase 3: WARNING - {len(overlap)} session(s) overlap between train pool and test "
-              f"({overlap_fraction:.2%} of train sessions): {overlap}. Excluding these sessions' "
-              "trials from train/val — test remains untouched as the official held-out set.")
-    else:
-        print("Phase 3: session overlap check passed — zero overlap.")
-
-    trial_splits = assign_block_splits(sessionnum, blocknum, cfg.split.val_fraction, cfg.split.seed)
-
-    if overlap:
-        exclude_mask = np.isin(sessionnum, list(overlap))
-        trial_splits = trial_splits.copy()
-        trial_splits[exclude_mask] = "excluded"
-        print(f"Phase 3: excluded {exclude_mask.sum()} trials from {len(overlap)} overlapping session(s).")
-
-    validation = validate_split(sessionnum, blocknum, trial_splits)
-    if validation["block_overlap"]:
-        raise RuntimeError(f"Block overlap detected: {validation['block_overlap']}")
-    print(f"Phase 3: train={validation['n_train']}, val={validation['n_val']}, zero overlap confirmed.")
-
-    materialize_split(train_pool_path, trial_splits, {"train": train_path, "val": val_path})
-    print(f"Phase 3: wrote {train_path} and {val_path}.")
-
-
-# ---------------------------------------------------------------------------
-# Phase 4: Preprocessing + Path A Features
-# ---------------------------------------------------------------------------
-
-def _append_chunk(dset, chunk):
-    old_size = dset.shape[0]
-    dset.resize(old_size + chunk.shape[0], axis=0)
-    dset[old_size:old_size + chunk.shape[0]] = chunk
-
-
-def _process_split_chunked(cfg, split_path, out_filtered_path, out_features_path,
-                             bad_channels, good_channels, center, scale, thresholds,
-                             chunk_size=2000):
-    """
-    Streams a train/val split through filtering + normalization + artifact
-    flagging + feature extraction in small chunks, writing each chunk to
-    disk immediately - never holding the full split in memory. Replaces
-    the old load-everything-at-once approach, which crashed at 100% scale.
-    """
-    fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
-    n_good = len(good_channels)
-
-    with h5py.File(split_path, "r") as src:
-        n_total = src["eeg"].shape[0]
-        label_binary_all = src["label_binary"][:]
-        label_digit_all = src["label_digit"][:]
-
-        with h5py.File(out_filtered_path, "w") as f_filt, h5py.File(out_features_path, "w") as f_feat:
-            eeg_ds = f_filt.create_dataset("eeg", shape=(0, n_good, cfg.data.n_samples),
-                                            maxshape=(None, n_good, cfg.data.n_samples),
-                                            chunks=(1, n_good, cfg.data.n_samples),
-                                            compression="gzip", dtype="float32")
-            lb_ds = f_filt.create_dataset("label_binary", shape=(0,), maxshape=(None,), dtype="int8")
-            ld_ds = f_filt.create_dataset("label_digit", shape=(0,), maxshape=(None,), dtype="int8")
-            any_ds = f_filt.create_dataset("artifact_any", shape=(0, n_good), maxshape=(None, n_good), dtype="bool")
-            nflag_ds = f_filt.create_dataset("n_flagged_channels_per_trial", shape=(0,), maxshape=(None,), dtype="int64")
-            concern_ds = f_filt.create_dataset("trial_concern", shape=(0,), maxshape=(None,), dtype="bool")
-
-            feat_ds = feat_lb_ds = feat_ld_ds = None
-
-            for start in range(0, n_total, chunk_size):
-                end = min(start + chunk_size, n_total)
-                eeg_chunk = src["eeg"][start:end]
-                eeg_chunk, _ = exclude_channels(eeg_chunk, bad_channels, cfg.data.n_channels_nominal)
-
-                filtered_chunk = apply_filters(eeg_chunk, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                                fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-                norm_chunk = apply_normalization(filtered_chunk, center, scale)
-                arrays_chunk = compute_artifact_arrays(norm_chunk)
-                flags_chunk = flag_artifacts(arrays_chunk, thresholds, ac.trial_concern_min_channels)
-
-                _append_chunk(eeg_ds, norm_chunk)
-                _append_chunk(lb_ds, label_binary_all[start:end])
-                _append_chunk(ld_ds, label_digit_all[start:end])
-                _append_chunk(any_ds, flags_chunk["any"])
-                _append_chunk(nflag_ds, flags_chunk["n_flagged_channels_per_trial"])
-                _append_chunk(concern_ds, flags_chunk["trial_concern"])
-
-                features_chunk = extract_features_batch(eeg_chunk, fs, cfg.feature.eeg_bands, cfg.feature.welch_nperseg)
-                if feat_ds is None:
-                    n_feat = features_chunk.shape[1]
-                    feat_ds = f_feat.create_dataset("features", shape=(0, n_feat), maxshape=(None, n_feat),
-                                                     compression="gzip", dtype="float32")
-                    feat_lb_ds = f_feat.create_dataset("label_binary", shape=(0,), maxshape=(None,), dtype="int8")
-                    feat_ld_ds = f_feat.create_dataset("label_digit", shape=(0,), maxshape=(None,), dtype="int8")
-                _append_chunk(feat_ds, features_chunk)
-                _append_chunk(feat_lb_ds, label_binary_all[start:end])
-                _append_chunk(feat_ld_ds, label_digit_all[start:end])
-
-                print(f"  processed {end}/{n_total} trials...")
-
-            f_filt.create_dataset("channel_indices", data=good_channels)
-
-
-def run_phase4_preprocessing(cfg: PipelineConfig, force: bool = False,
-                               diagnostic_subsample_size: int = 25000, chunk_size: int = 2000) -> None:
-    """
-    diagnostic_subsample_size: trials used to fit bad-channel detection,
-    normalization, and artifact thresholds. Raised from an earlier 5000 to
-    25000 for better coverage of rare artifact patterns, while staying
-    small enough to avoid memory issues.
-    chunk_size: trials processed at once during the main pass - keeps peak
-    memory roughly constant regardless of total dataset size.
-    """
-    cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
-    cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
-    preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
-    preprocessing_dir.mkdir(parents=True, exist_ok=True)
-
-    train_filtered_path = cfg.data.filtered_dir / "train_filtered.h5"
-    val_filtered_path = cfg.data.filtered_dir / "val_filtered.h5"
-    train_features_path = cfg.data.features_dir / "train_features.h5"
-    val_features_path = cfg.data.features_dir / "val_features.h5"
-
-    if not force and all(p.exists() for p in [train_filtered_path, val_filtered_path,
-                                                  train_features_path, val_features_path]):
-        print("Phase 4: all outputs already exist, skipping.")
+    if checkpoint_path.exists() and not force:
         return
 
-    train_path = cfg.data.splits_dir / "train.h5"
-    val_path = cfg.data.splits_dir / "val.h5"
-    fc, ac, fs = cfg.filter, cfg.artifact, cfg.data.sample_rate_hz
+    print(f"\nPipeline: {cfg.model.model_name!r} needs a trained eegnet_fresh checkpoint for "
+          f"task={source_task!r} (not found at {checkpoint_path}) - training it first.\n")
 
-    with h5py.File(train_path, "r") as f:
-        n_train = f["eeg"].shape[0]
-        if n_train > diagnostic_subsample_size:
-            rng = np.random.default_rng(cfg.seed)
-            diag_idx = np.sort(rng.choice(n_train, size=diagnostic_subsample_size, replace=False))
-            eeg_diag = f["eeg"][diag_idx]
-        else:
-            eeg_diag = f["eeg"][:]
+    # Deep copy so the prerequisite run can't mutate the caller's cfg -
+    # everything except model_name/task carries over unchanged, so the
+    # SAME acquired/preprocessed data is reused, not redone.
+    prereq_cfg = copy.deepcopy(cfg)
+    prereq_cfg.model.model_name = "eegnet_fresh"
+    prereq_cfg.model.task = source_task
+    run_pipeline(prereq_cfg, force=force, run_permutation=run_permutation)
 
-    print(f"Phase 4: diagnostic pass on {len(eeg_diag)} of {n_train} trials...")
-    eeg_diag_filtered_full = apply_filters(eeg_diag, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                            fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-    center_full, scale_full = fit_normalization_robust(eeg_diag_filtered_full)
-    bad_channels = detect_bad_channels(scale_full, ac.bad_channel_scale_floor)
-    print(f"Phase 4: bad channels: {bad_channels}")
-
-    eeg_diag, good_channels = exclude_channels(eeg_diag, bad_channels, cfg.data.n_channels_nominal)
-    eeg_diag_filtered = eeg_diag_filtered_full[:, good_channels, :]
-    del eeg_diag_filtered_full
-
-    center, scale = fit_normalization_robust(eeg_diag_filtered)
-    save_normalization_params(preprocessing_dir / "normalization_params.npz", center, scale)
-
-    diag_norm = apply_normalization(eeg_diag_filtered, center, scale)
-    diag_arrays = compute_artifact_arrays(diag_norm)
-    thresholds = derive_thresholds(diag_arrays, ac.artifact_percentile, ac.flatline_percentile)
-    save_artifact_params(preprocessing_dir / "artifact_params.json", bad_channels, thresholds)
-    del eeg_diag, eeg_diag_filtered, diag_norm, diag_arrays
-
-    print(f"\nPhase 4: processing train (chunk_size={chunk_size})...")
-    _process_split_chunked(cfg, train_path, train_filtered_path, train_features_path,
-                            bad_channels, good_channels, center, scale, thresholds, chunk_size)
-    print(f"Phase 4: wrote {train_filtered_path} and {train_features_path}")
-
-    print(f"\nPhase 4: processing val (chunk_size={chunk_size})...")
-    _process_split_chunked(cfg, val_path, val_filtered_path, val_features_path,
-                            bad_channels, good_channels, center, scale, thresholds, chunk_size)
-    print(f"Phase 4: wrote {val_filtered_path} and {val_features_path}")
-
-    with h5py.File(train_filtered_path, "r") as f:
-        print(f"\nPhase 4: train trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
-    with h5py.File(val_filtered_path, "r") as f:
-        print(f"Phase 4: val trial_concern: {f['trial_concern'][:].sum()} / {f['trial_concern'].shape[0]}")
+    print(f"\nPipeline: prerequisite {source_task!r} eegnet_fresh training complete - "
+          f"resuming {cfg.model.model_name!r}.\n")
 
 
-def _run_phase4b_features(cfg: PipelineConfig, force: bool = False) -> None:
-    cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
-    train_features_path = cfg.data.features_dir / "train_features.h5"
-    val_features_path = cfg.data.features_dir / "val_features.h5"
-
-    if not force and _exists(train_features_path) and _exists(val_features_path):
-        print("Phase 4b (features): already exist, skipping.")
-        return
-
-    cached = _phase4_cache.get(cfg.data.variant_tag)
-    if cached is None:
-        raise RuntimeError(
-            f"Phase 4b requires Phase 4 to have run in the same session for "
-            f"variant_tag={cfg.data.variant_tag!r}. Re-run run_phase4_preprocessing(cfg, force=True) first."
-        )
-
-    fs, bands, nperseg = cfg.data.sample_rate_hz, cfg.feature.eeg_bands, cfg.feature.welch_nperseg
-    print("Phase 4b: extracting train features...")
-    features_train = extract_features_batch(cached["train"], fs, bands, nperseg)
-    print("Phase 4b: extracting val features...")
-    features_val = extract_features_batch(cached["val"], fs, bands, nperseg)
-
-    with h5py.File(train_features_path, "w") as f:
-        f.create_dataset("features", data=features_train, compression="gzip")
-        f.create_dataset("label_binary", data=cached["label_binary_train"])
-        f.create_dataset("label_digit", data=cached["label_digit_train"])
-    with h5py.File(val_features_path, "w") as f:
-        f.create_dataset("features", data=features_val, compression="gzip")
-        f.create_dataset("label_binary", data=cached["label_binary_val"])
-        f.create_dataset("label_digit", data=cached["label_digit_val"])
-    print(f"Phase 4b: wrote {train_features_path} and {val_features_path}.")
-
-
-# ---------------------------------------------------------------------------
-# Phase 5/6: Train + Evaluate (branches on cfg.model.is_deep) + Permutation Test
-# ---------------------------------------------------------------------------
-
-def _load_stage_data_classical(cfg: PipelineConfig):
-    """Loads Path A features, applies trial_concern exclusion, and filters
-    to digit-only trials if stage2. Returns (X_train, y_train, X_val, y_val, average)."""
-    with h5py.File(cfg.data.features_dir / "train_features.h5", "r") as f:
-        X_train, y_bin_train, y_digit_train = f["features"][:], f["label_binary"][:], f["label_digit"][:]
-    with h5py.File(cfg.data.features_dir / "val_features.h5", "r") as f:
-        X_val, y_bin_val, y_digit_val = f["features"][:], f["label_binary"][:], f["label_digit"][:]
-    with h5py.File(cfg.data.filtered_dir / "train_filtered.h5", "r") as f:
-        train_concern = f["trial_concern"][:]
-    with h5py.File(cfg.data.filtered_dir / "val_filtered.h5", "r") as f:
-        val_concern = f["trial_concern"][:]
-
-    keep_train, keep_val = ~train_concern, ~val_concern
-
-    if cfg.model.stage == "stage2":
-        keep_train &= (y_digit_train != -1)
-        keep_val &= (y_digit_val != -1)
-        y_train, y_val, average = y_digit_train[keep_train], y_digit_val[keep_val], "macro"
-    else:
-        y_train, y_val, average = y_bin_train[keep_train], y_bin_val[keep_val], "binary"
-
-    return X_train[keep_train], y_train, X_val[keep_val], y_val, average
-
-
-def _load_stage_data_deep_lazy(cfg: PipelineConfig):
+def run_pipeline(cfg: PipelineConfig, force: bool = False, run_permutation: bool = True) -> dict:
     """
-    Returns (train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val)
-    instead of full in-memory arrays - only labels and trial_concern flags
-    (small) are loaded; the actual EEG data stays on disk and is read
-    per-trial by LazyEEGDataset during training. Required at 100% scale,
-    where the full filtered eeg array (~13GB) crashed Colab outright.
+    Runs every step needed to go from nothing to a trained, evaluated
+    model, for whatever cfg.model.task/model_name selects. This is the
+    ONE function scripts/run_pipeline.py calls.
     """
-    train_path = cfg.data.filtered_dir / "train_filtered.h5"
-    val_path = cfg.data.filtered_dir / "val_filtered.h5"
+    _ensure_reuse_source_trained(cfg, force=force, run_permutation=run_permutation)
 
-    with h5py.File(train_path, "r") as f:
-        y_bin_train = f["label_binary"][:]
-        y_digit_train = f["label_digit"][:]
-        train_concern = f["trial_concern"][:]
-    with h5py.File(val_path, "r") as f:
-        y_bin_val = f["label_binary"][:]
-        y_digit_val = f["label_digit"][:]
-        val_concern = f["trial_concern"][:]
-
-    keep_train, keep_val = ~train_concern, ~val_concern
-    if cfg.model.stage == "stage2":
-        keep_train &= (y_digit_train != -1)
-        keep_val &= (y_digit_val != -1)
-        y_train_full, y_val_full = y_digit_train, y_digit_val
-    else:
-        y_train_full, y_val_full = y_bin_train, y_bin_val
-
-    train_indices = np.where(keep_train)[0]
-    val_indices = np.where(keep_val)[0]
-    return train_path, train_indices, y_train_full[train_indices], val_path, val_indices, y_val_full[val_indices]
+    run_data_preparation(cfg, force=force)
+    run_preprocessing(cfg, force=force)
+    if not cfg.model.is_deep:
+        run_features(cfg, force=force)
+    return run_model_training(cfg, run_permutation=run_permutation)
 
 
-def _save_results(cfg: PipelineConfig, results: dict) -> None:
-    results_dir = cfg.model.results_dir(cfg.data.variant_tag)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    with open(results_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"Results saved to {results_dir / 'results.json'}")
-
-
-def run_model_classical(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
-    X_train, y_train, X_val, y_val, average = _load_stage_data_classical(cfg)
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-
-    model = build_classical_model(cfg.model, cfg.seed)
-    print(f"Phase 5 [{cfg.model.stage}/{cfg.model.model_name}]: training...")
-    metrics, cm, fitted_model = evaluate_sklearn_model(
-        cfg.model.model_name, model, X_train_scaled, y_train, X_val_scaled, y_val, average
-    )
-    print(metrics)
-
-    checkpoint_path = cfg.model.checkpoint_path(cfg.data.variant_tag)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": fitted_model, "scaler": scaler}, checkpoint_path)
-    print(f"Model saved to {checkpoint_path}")
-
-    permutation_result = None
-    if run_permutation:
-        print("Running permutation test...")
-        n = cfg.permutation.classical_subsample_size
-        if n is not None and n < len(X_train_scaled):
-            rng = np.random.default_rng(cfg.seed)
-            idx = rng.choice(len(X_train_scaled), size=n, replace=False)
-            X_perm, y_perm = X_train_scaled[idx], y_train[idx]
-        else:
-            X_perm, y_perm = X_train_scaled, y_train
-
-        model_fn = lambda: build_classical_model_for_permutation(
-            cfg.model, cfg.seed, cfg.permutation.svm_permutation_max_iter
-        )
-        real_acc, shuffled_accs = permutation_test_sklearn(
-            model_fn, X_perm, y_perm, X_val_scaled, y_val,
-            n_permutations=cfg.permutation.n_permutations_classical, seed=cfg.seed,
-        )
-        gap = real_acc - shuffled_accs.mean()
-        permutation_result = {
-            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
-            "shuffled_std": shuffled_accs.std(),
-            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
-        }
-    else:
-        print("Skipping permutation test (run_permutation=False).")
-
-    results = {
-        "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage, "model": cfg.model.model_name},
-        "metrics": metrics,
-        "confusion_matrix": cm.tolist(),
-        "permutation_test": permutation_result,
-    }
-    _save_results(cfg, results)
-    return results
-
-
-def _stage1_eegnet_checkpoint_path(cfg: PipelineConfig) -> Path:
+def prompt_for_variants(cfg: PipelineConfig) -> PipelineConfig:
     """
-    Stage 1's EEGNet checkpoint lives under a DIFFERENT run_tag (same
-    variant_tag, but stage='stage1' instead of 'stage2') - built as a
-    one-off ModelConfig matching Stage 1's exact naming, not cfg.model
-    itself (which is Stage 2's config at the point this is called).
+    Interactively confirms/overrides each pluggable step's variant at the
+    terminal - shows the current value in brackets, Enter keeps it.
+    Mutates and returns the same cfg. Only called when
+    scripts/run_pipeline.py is run with --interactive.
     """
-    from src.config import ModelConfig
-    stage1_model_cfg = ModelConfig(model_name="eegnet", stage="stage1", model_root=cfg.model.model_root)
-    return stage1_model_cfg.checkpoint_path(cfg.data.variant_tag)
+    from src.features.extraction import FEATURE_REGISTRY
+    from src.preprocessing.artifacts import ARTIFACT_REGISTRY
+    from src.preprocessing.filters import FILTER_REGISTRY
+    from src.preprocessing.normalization import NORMALIZATION_REGISTRY
 
+    def ask(label: str, current: str, options) -> str:
+        raw = input(f"{label} [{current}]  (options: {', '.join(sorted(options))}): ").strip()
+        return raw or current
 
-def run_model_deep(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
-    # Deferred import: torch is only required when a deep model is actually
-    # selected, so classical-only usage of this package never needs it installed.
-    import torch
-    from src.training.loop import (make_lazy_loaders, train_with_checkpointing, train_stage2_path_b2,
-                                     run_epoch, LazyEEGDataset, EEGDataset)
-    from torch.utils.data import DataLoader
-    import torch.nn as nn
+    cfg.filter.variant = ask("Filter variant", cfg.filter.variant, FILTER_REGISTRY.names())
+    cfg.normalization.variant = ask("Normalization variant", cfg.normalization.variant, NORMALIZATION_REGISTRY.names())
+    cfg.artifact.variant = ask("Artifact variant", cfg.artifact.variant, ARTIFACT_REGISTRY.names())
+    cfg.model.task = ask("Task", cfg.model.task, TASK_INFO.keys())
+    cfg.model.model_name = ask("Model", cfg.model.model_name, CLASSICAL_MODEL_NAMES | DEEP_MODEL_NAMES)
+    cfg.model.__post_init__()   # re-validate after manual overrides
 
-    train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val = _load_stage_data_deep_lazy(cfg)
+    if not cfg.model.is_deep:
+        cfg.feature.variant = ask("Feature variant", cfg.feature.variant, FEATURE_REGISTRY.names())
 
-    with h5py.File(train_h5_path, "r") as f:
-        n_channels, n_samples = f["eeg"].shape[1], f["eeg"].shape[2]
-
-    n_classes = 2 if cfg.model.stage == "stage1" else 10
-    is_stage2 = cfg.model.stage == "stage2"
-    variant = cfg.model.stage2.variant if is_stage2 else None
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    label = f"{cfg.model.stage}/{cfg.model.model_name}" + (f"/{variant}" if variant else "")
-    print(f"Phase 6 [{label}]: using device {device}, train={len(train_indices)}, val={len(val_indices)} trials")
-    torch.manual_seed(cfg.seed)
-
-    train_loader, val_loader = make_lazy_loaders(train_h5_path, train_indices, y_train,
-                                                   val_h5_path, val_indices, y_val, cfg.training.batch_size)
-
-    if is_stage2:
-        stage1_ckpt = _stage1_eegnet_checkpoint_path(cfg)
-        model = build_stage2_eegnet(cfg.model, n_channels, n_samples, n_classes,
-                                     stage1_checkpoint_path=stage1_ckpt).to(device)
-    else:
-        model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
-
-    checkpoint_path = cfg.model.checkpoint_path(cfg.data.variant_tag)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if is_stage2 and variant == "path_b2":
-        s2 = cfg.model.stage2
-        history = train_stage2_path_b2(
-            model, train_loader, val_loader, checkpoint_path, device,
-            freeze_epochs=s2.freeze_epochs, finetune_epochs=s2.finetune_epochs,
-            base_learning_rate=cfg.training.learning_rate,
-            finetune_lr_multiplier=s2.finetune_lr_multiplier,
-            early_stop_patience=cfg.training.early_stop_patience,
-        )
-    else:
-        # Path A, B1, and C (Path C's frozen stage1_backbone has requires_grad=False,
-        # so train_with_checkpointing's optimizer correctly only updates the
-        # trainable stage2_backbone + classifier) all use standard single-phase training.
-        history = train_with_checkpointing(
-            model, train_loader, val_loader, checkpoint_path, device,
-            cfg.training.n_epochs, cfg.training.learning_rate, cfg.training.early_stop_patience,
-        )
-
-    model.load_state_dict(torch.load(checkpoint_path))
-    model.eval()
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            logits = model(X_batch.to(device))
-            all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-            all_labels.extend(y_batch.numpy())
-
-    average = "binary" if cfg.model.stage == "stage1" else "macro"
-    metrics = {
-        "model": cfg.model.model_name,
-        "accuracy": accuracy_score(all_labels, all_preds),
-        "precision": precision_score(all_labels, all_preds, average=average, zero_division=0),
-        "recall": recall_score(all_labels, all_preds, average=average, zero_division=0),
-        "f1": f1_score(all_labels, all_preds, average=average, zero_division=0),
-    }
-    print(metrics)
-
-    permutation_result = None
-    if run_permutation:
-        print("Running (reduced-scale) permutation test...")
-        # Reads ONLY the permutation subsample's rows from disk (h5py fancy
-        # indexing), never the full train array - same lazy principle as
-        # the main training loop, just a smaller in-memory-safe subsample
-        # since permutation testing is already deliberately reduced-scale.
-        rng = np.random.default_rng(cfg.seed)
-        perm_size = min(cfg.permutation.deep_subsample_size, len(train_indices))
-        perm_idx_into_indices = rng.choice(len(train_indices), size=perm_size, replace=False)
-        perm_rows = np.sort(train_indices[perm_idx_into_indices])
-        y_perm = y_train[np.searchsorted(train_indices, perm_rows)]
-
-        with h5py.File(train_h5_path, "r") as f:
-            eeg_perm_sub = f["eeg"][perm_rows]
-
-        def train_fn(eeg_sub, y_sub):
-            m = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
-            opt = torch.optim.Adam(m.parameters(), lr=cfg.training.learning_rate)
-            crit = nn.CrossEntropyLoss()
-            loader = DataLoader(EEGDataset(eeg_sub, y_sub), batch_size=cfg.training.batch_size, shuffle=True)
-            for _ in range(cfg.permutation.deep_quick_epochs):
-                run_epoch(m, loader, opt, crit, device, train=True)
-            return m
-
-        def eval_fn(m, loader):
-            m.eval()
-            preds, labels = [], []
-            with torch.no_grad():
-                for X_batch, y_batch in loader:
-                    logits = m(X_batch.to(device))
-                    preds.extend(logits.argmax(dim=1).cpu().numpy())
-                    labels.extend(y_batch.numpy())
-            return accuracy_score(labels, preds)
-
-        real_acc, shuffled_accs = permutation_test_torch(
-            train_fn, eval_fn, eeg_perm_sub, y_perm, val_loader,
-            n_permutations=cfg.permutation.n_permutations_deep,
-            subsample_size=perm_size, seed=cfg.seed,
-        )
-        gap = real_acc - shuffled_accs.mean()
-        permutation_result = {
-            "real_accuracy": real_acc, "shuffled_mean": shuffled_accs.mean(),
-            "shuffled_std": shuffled_accs.std(),
-            "gap": gap, "gap_over_std": gap / shuffled_accs.std() if shuffled_accs.std() > 0 else None,
-        }
-    else:
-        print("Skipping permutation test (run_permutation=False).")
-
-    results = {
-        "config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage,
-                   "model": cfg.model.model_name, "stage2_variant": variant},
-        "metrics": metrics,
-        "best_val_acc": history["best_val_acc"],
-        "permutation_test": permutation_result,
-    }
-    _save_results(cfg, results)
-    return results
-
-
-def run_phase5_6_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
-    """Single entry point for modeling - branches on cfg.model.is_deep so
-    callers never need to know which path they're triggering."""
-    if cfg.model.is_deep:
-        return run_model_deep(cfg, run_permutation=run_permutation)
-    else:
-        return run_model_classical(cfg, run_permutation=run_permutation)
-
-
-# ---------------------------------------------------------------------------
-# Phase 7: Test-Set Processing + Evaluation
-#
-# CRITICAL RULE: nothing here ever re-fits anything. Every parameter used
-# (normalization center/scale, bad channels, artifact thresholds) is
-# LOADED from what Phase 4 already fit on train - test data only ever
-# gets these values APPLIED, never used to derive new ones. This is what
-# makes test a genuinely held-out evaluation rather than leaked information.
-# ---------------------------------------------------------------------------
-
-def run_phase7_test_processing(cfg: PipelineConfig, force: bool = False) -> None:
-    """
-    Applies Phase 4's already-fitted preprocessing (bad-channel exclusion,
-    filtering, normalization, artifact thresholds) to the test set, and
-    extracts Path A features - producing test_filtered.h5 and
-    test_features.h5, matching train/val's structure exactly.
-    """
-    test_filtered_path = cfg.data.filtered_dir / "test_filtered.h5"
-    test_features_path = cfg.data.features_dir / "test_features.h5"
-
-    if not force and _exists(test_filtered_path) and _exists(test_features_path):
-        print("Phase 7: test outputs already exist, skipping.")
-        return
-
-    preprocessing_dir = cfg.model.preprocessing_dir(cfg.data.variant_tag)
-    norm_path = preprocessing_dir / "normalization_params.npz"
-    artifact_path = preprocessing_dir / "artifact_params.json"
-    if not norm_path.exists() or not artifact_path.exists():
-        raise RuntimeError(
-            f"Fitted preprocessing params not found at {preprocessing_dir} - "
-            "run_phase4_preprocessing() must complete for this dataset_variant "
-            "before test data can be processed."
-        )
-
-    center, scale = load_normalization_params(norm_path)
-    saved = load_artifact_params(artifact_path)
-    bad_channels, thresholds = saved["bad_channels"], saved["thresholds"]
-    print(f"Phase 7: loaded fitted params - bad_channels={bad_channels}, thresholds={thresholds}")
-
-    test_path = cfg.data.splits_dir / "test.h5"
-    with h5py.File(test_path, "r") as f:
-        eeg_test_raw = f["eeg"][:]
-        label_binary_test = f["label_binary"][:]
-        label_digit_test = f["label_digit"][:]
-
-    fc, fs = cfg.filter, cfg.data.sample_rate_hz
-
-    # Bad-channel exclusion: APPLY the saved list, never re-detect on test.
-    eeg_test_raw, good_channels = exclude_channels(eeg_test_raw, bad_channels, cfg.data.n_channels_nominal)
-
-    print("Phase 7: filtering test set...")
-    eeg_test_filtered = apply_filters(eeg_test_raw, fs, fc.bandpass_low_hz, fc.bandpass_high_hz,
-                                       fc.filter_order, fc.apply_notch, fc.notch_freq_hz)
-
-    # Normalization: APPLY the saved center/scale, never re-fit.
-    eeg_test_norm = apply_normalization(eeg_test_filtered, center, scale)
-
-    # Artifact flagging: APPLY the saved thresholds, never re-derive.
-    test_arrays = compute_artifact_arrays(eeg_test_norm)
-    test_artifact_info = flag_artifacts(test_arrays, thresholds, cfg.artifact.trial_concern_min_channels)
-    print(f"Phase 7: test trial_concern: {test_artifact_info['trial_concern'].sum()} / {len(eeg_test_norm)}")
-
-    cfg.data.filtered_dir.mkdir(parents=True, exist_ok=True)
-    with h5py.File(test_filtered_path, "w") as f:
-        f.create_dataset("eeg", data=eeg_test_norm, compression="gzip")
-        f.create_dataset("label_binary", data=label_binary_test)
-        f.create_dataset("label_digit", data=label_digit_test)
-        f.create_dataset("channel_indices", data=good_channels)
-        f.create_dataset("artifact_any", data=test_artifact_info["any"])
-        f.create_dataset("n_flagged_channels_per_trial", data=test_artifact_info["n_flagged_channels_per_trial"])
-        f.create_dataset("trial_concern", data=test_artifact_info["trial_concern"])
-    print(f"Phase 7: wrote {test_filtered_path}")
-
-    # Path A features - computed on RAW (channel-excluded, unfiltered) test
-    # signal, same as train/val (see features/extraction.py docstring for why).
-    print("Phase 7: extracting test features...")
-    features_test = extract_features_batch(eeg_test_raw, fs, cfg.feature.eeg_bands, cfg.feature.welch_nperseg)
-
-    cfg.data.features_dir.mkdir(parents=True, exist_ok=True)
-    with h5py.File(test_features_path, "w") as f:
-        f.create_dataset("features", data=features_test, compression="gzip")
-        f.create_dataset("label_binary", data=label_binary_test)
-        f.create_dataset("label_digit", data=label_digit_test)
-    print(f"Phase 7: wrote {test_features_path}")
-
-
-def _load_test_data_classical(cfg: PipelineConfig):
-    with h5py.File(cfg.data.features_dir / "test_features.h5", "r") as f:
-        X_test, y_bin_test, y_digit_test = f["features"][:], f["label_binary"][:], f["label_digit"][:]
-    with h5py.File(cfg.data.filtered_dir / "test_filtered.h5", "r") as f:
-        test_concern = f["trial_concern"][:]
-
-    keep = ~test_concern
-    if cfg.model.stage == "stage2":
-        keep &= (y_digit_test != -1)
-        y_test, average = y_digit_test[keep], "macro"
-    else:
-        y_test, average = y_bin_test[keep], "binary"
-    return X_test[keep], y_test, average
-
-
-def _load_test_data_deep_lazy(cfg: PipelineConfig):
-    """Same lazy pattern as _load_stage_data_deep_lazy - test set at 100%
-    is no longer capped either (test_target_per_class becomes None), so
-    it's worth the same treatment rather than assuming it's always small."""
-    test_path = cfg.data.filtered_dir / "test_filtered.h5"
-    with h5py.File(test_path, "r") as f:
-        y_bin_test = f["label_binary"][:]
-        y_digit_test = f["label_digit"][:]
-        test_concern = f["trial_concern"][:]
-    keep = ~test_concern
-    if cfg.model.stage == "stage2":
-        keep &= (y_digit_test != -1)
-        y_test_full = y_digit_test
-    else:
-        y_test_full = y_bin_test
-    test_indices = np.where(keep)[0]
-    return test_path, test_indices, y_test_full[test_indices]
-
-
-def run_phase7_evaluate_on_test(cfg: PipelineConfig) -> dict:
-    """
-    Loads the ALREADY-TRAINED checkpoint from Phase 5/6 (does not retrain)
-    and evaluates it on the held-out test set. This is the true, final,
-    only-look-at-once number for this run.
-    """
-    from src.evaluation.metrics import compute_classification_metrics
-    checkpoint_path = cfg.model.checkpoint_path(cfg.data.variant_tag)
-    if not checkpoint_path.exists():
-        raise RuntimeError(
-            f"No trained checkpoint found at {checkpoint_path} - "
-            "run_phase5_6_model() must complete before test evaluation."
-        )
-
-    if cfg.model.is_deep:
-        import torch
-        from torch.utils.data import DataLoader
-        from src.training.loop import LazyEEGDataset
-
-        test_path, test_indices, y_test = _load_test_data_deep_lazy(cfg)
-        with h5py.File(test_path, "r") as f:
-            n_channels, n_samples = f["eeg"].shape[1], f["eeg"].shape[2]
-        n_classes = 2 if cfg.model.stage == "stage1" else 10
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if cfg.model.stage == "stage2":
-            stage1_ckpt = _stage1_eegnet_checkpoint_path(cfg)
-            model = build_stage2_eegnet(cfg.model, n_channels, n_samples, n_classes,
-                                         stage1_checkpoint_path=stage1_ckpt).to(device)
-        else:
-            model = build_eegnet(cfg.model, n_channels, n_samples, n_classes).to(device)
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        model.eval()
-
-        loader = DataLoader(LazyEEGDataset(test_path, test_indices, y_test),
-                             batch_size=cfg.training.batch_size, shuffle=False)
-
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for X_batch, y_batch in loader:
-                logits = model(X_batch.to(device))
-                all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-                all_labels.extend(y_batch.numpy())
-
-        average = "binary" if cfg.model.stage == "stage1" else "macro"
-        metrics = compute_classification_metrics(all_labels, all_preds, cfg.model.model_name, average)
-    else:
-        X_test, y_test, average = _load_test_data_classical(cfg)
-        saved = joblib.load(checkpoint_path)
-        model, scaler = saved["model"], saved["scaler"]
-        X_test_scaled = scaler.transform(X_test)
-        preds = model.predict(X_test_scaled)
-        metrics = compute_classification_metrics(y_test, preds, cfg.model.model_name, average)
-
-    print(f"Phase 7 [{cfg.model.stage}/{cfg.model.model_name}] TEST metrics: {metrics}")
-
-    # Compare against val, if we have it - a large val/test gap is a red
-    # flag for overfitting to val itself (e.g. via repeated tuning against it).
-    results_dir = cfg.model.results_dir(cfg.data.variant_tag)
-    val_results_path = results_dir / "results.json"
-    comparison = None
-    if val_results_path.exists():
-        with open(val_results_path) as f:
-            val_results = json.load(f)
-        val_acc = val_results["metrics"]["accuracy"]
-        comparison = {"val_accuracy": val_acc, "test_accuracy": metrics["accuracy"],
-                      "gap": val_acc - metrics["accuracy"]}
-        print(f"Val vs. test: {comparison}")
-
-    test_results = {"config": {"variant_tag": cfg.data.variant_tag, "stage": cfg.model.stage,
-                                "model": cfg.model.model_name},
-                     "test_metrics": metrics, "val_vs_test": comparison}
-    results_dir.mkdir(parents=True, exist_ok=True)
-    with open(results_dir / "test_results.json", "w") as f:
-        json.dump(test_results, f, indent=2, default=str)
-    print(f"Test results saved to {results_dir / 'test_results.json'}")
-
-    return test_results
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main(
-    dataset_variant: str = "2B",
-    subsample_fraction: float = 0.20,
-    stage: str = "stage1",
-    model_name: str = "random_forest",
-    stage2_variant: str = "path_a",
-    seed: int = 42,
-    force: bool = False,
-) -> dict:
-    """
-    The intended way to run this pipeline: set these parameters, get a
-    fully-processed dataset and a trained, evaluated model back. Everything
-    else - paths, HF repo id, trial counts, which training code path runs -
-    is derived automatically from these.
-    """
-    cfg = build_config(dataset_variant, subsample_fraction, stage, model_name, stage2_variant, seed)
-    print(f"=== dataset_variant={dataset_variant!r} subsample_fraction={subsample_fraction} "
-          f"stage={stage!r} model={model_name!r} stage2_variant={stage2_variant!r} ===")
-
-    run_phase2_data_acquisition(cfg, force=force)
-    run_phase3_splitting(cfg, force=force)
-    run_phase4_preprocessing(cfg, force=force)
-    results = run_phase5_6_model(cfg)
-
-    print("\nFinal results:")
-    print(json.dumps(results, indent=2, default=str))
-    return results
-
-
-if __name__ == "__main__":
-    main()
+    return cfg

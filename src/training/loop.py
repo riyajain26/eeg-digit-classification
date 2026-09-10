@@ -1,7 +1,15 @@
 """
-PyTorch Dataset wrapper and training loop with checkpointing/early stopping,
-from Notebook 06, Sections 3 and 5. Designed to run identically on CPU,
-local GPU, or Colab GPU - device is passed in, never hardcoded.
+PyTorch Dataset wrapper and training loop with checkpointing/early
+stopping. Designed to run identically on CPU, local GPU, or Colab GPU -
+device is passed in, never hardcoded.
+
+No changes from the original beyond docstrings/renaming: this is training
+mechanics shared by every EEGNet variant regardless of model_name or
+stage2.variant - there's no "pluggable strategy" axis here to register,
+just one correct way to run a training loop with checkpointing and early
+stopping (plus one special case, eegnet_finetuned_backbone_reuse's
+two-phase freeze/fine-tune, which is architecture-driven rather than an
+independent choice - see train_with_two_phase_finetuning below).
 """
 
 from pathlib import Path
@@ -36,9 +44,10 @@ class LazyEEGDataset(Dataset):
     (train_filtered.h5's full eeg array alone is ~13GB, before any masking
     or training overhead, which crashed Colab's free-tier RAM outright).
 
-    indices: which rows of the HDF5 "eeg" dataset to use, AFTER trial_concern
-    and stage filtering have already been applied by the caller - this class
-    itself does no filtering, just lazy reads of whichever rows it's given.
+    indices: which rows of the HDF5 "eeg" dataset to use, AFTER
+    trial_concern and stage filtering have already been applied by the
+    caller - this class itself does no filtering, just lazy reads of
+    whichever rows it's given.
     """
     def __init__(self, h5_path, indices: np.ndarray, labels: np.ndarray):
         self.h5_path = h5_path
@@ -175,7 +184,7 @@ def train_with_checkpointing(
     return history
 
 
-def train_stage2_path_b2(
+def train_with_two_phase_finetuning(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -189,9 +198,10 @@ def train_stage2_path_b2(
     verbose: bool = True,
 ) -> dict:
     """
-    Two-phase training for Stage 2 Path B2:
+    Two-phase training for eegnet_finetuned_backbone_reuse:
     Phase 1 - train only the new head, backbone frozen (model must already
-              have freeze_backbone() applied before this is called).
+              have freeze_backbone() applied before this is called - see
+              models/factory.py's build_eegnet_finetuned_backbone_reuse).
     Phase 2 - unfreeze the backbone, continue training the whole network
               at a lower learning rate (base_learning_rate * finetune_lr_multiplier).
 
@@ -202,7 +212,7 @@ def train_stage2_path_b2(
     frozen-phase result before it has a chance to improve on it.
     """
     if verbose:
-        print("Path B2, Phase 1: training head only (backbone frozen)...")
+        print("Phase 1: training head only (backbone frozen)...")
     history_frozen = train_with_checkpointing(
         model, train_loader, val_loader, checkpoint_path, device,
         n_epochs=freeze_epochs, learning_rate=base_learning_rate,
@@ -211,7 +221,7 @@ def train_stage2_path_b2(
     best_after_freeze = history_frozen["best_val_acc"]
 
     if verbose:
-        print(f"\nPath B2, Phase 2: unfreezing backbone, fine-tuning "
+        print(f"\nPhase 2: unfreezing backbone, fine-tuning "
               f"(best so far: {best_after_freeze:.4f})...")
     model.unfreeze_backbone()
     model.load_state_dict(torch.load(checkpoint_path))   # continue from phase 1's best, not wherever training left off

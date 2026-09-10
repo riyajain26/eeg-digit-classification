@@ -1,11 +1,21 @@
 """
-Empirical frequency-content audit (Notebook 04, Section 2).
+Empirical frequency-content audit - a standalone diagnostic tool for
+validating a bandpass cutoff choice. Not part of the main preprocessing
+run.
 
-Kept as a standalone, reusable diagnostic tool rather than folded silently
-into the filter pipeline - useful any time a bandpass cutoff choice needs
-re-validating (new dataset subset, different task, wider/narrower band
-under consideration). Not run automatically as part of the main pipeline;
-call explicitly when you want to re-check a cutoff decision.
+Kept separate from filters.py rather than folded into it: this answers a
+different question ("is my chosen cutoff still appropriate for this
+data?") than filters.py answers ("apply this already-chosen cutoff").
+Not called automatically by src/steps/preprocessing.py - run it explicitly
+whenever a cutoff decision needs re-validating (new dataset subset,
+different task, wider/narrower band under consideration). This is the
+tool docs/roadmap_step3.md's planned "frequency audit re-run at 100%"
+diagnostic refers to.
+
+No registry here: there's one audit method, and "audit whether my filter
+choice is still right" isn't itself a pluggable pipeline step the way
+filtering/normalization/artifact-detection are - it's a tool you run
+alongside the pipeline, not a stage within it.
 """
 
 import numpy as np
@@ -14,10 +24,19 @@ from scipy import signal
 
 def compute_class_psd(eeg_a: np.ndarray, eeg_b: np.ndarray, fs: float, nperseg: int = 128):
     """
-    eeg_a, eeg_b: (n_trials, n_channels, n_samples) for two classes to compare
-    (e.g. digit vs. blank). Returns (freqs, log_diff) where log_diff has
-    shape (n_channels, n_freqs) - positive means eeg_a has more power than
-    eeg_b at that channel/frequency.
+    Compares power spectral density between two classes (e.g. digit vs.
+    blank) to see where in the frequency spectrum they actually differ.
+
+    Args:
+        eeg_a, eeg_b: (n_trials, n_channels, n_samples) for the two
+            classes being compared.
+        fs: sample rate in Hz.
+        nperseg: Welch method window length.
+
+    Returns:
+        (freqs, log_diff) - log_diff has shape (n_channels, n_freqs);
+        positive means eeg_a has more power than eeg_b at that
+        channel/frequency.
     """
     freqs, psd_a = signal.welch(eeg_a, fs=fs, nperseg=nperseg, axis=-1)
     _, psd_b = signal.welch(eeg_b, fs=fs, nperseg=nperseg, axis=-1)
@@ -30,14 +49,21 @@ def compute_class_psd(eeg_a: np.ndarray, eeg_b: np.ndarray, fs: float, nperseg: 
 
 def audit_cutoff(freqs: np.ndarray, log_diff: np.ndarray, cutoff_hz: float) -> dict:
     """
-    Quantitative check: is the region above cutoff_hz actually quieter
-    (less class-divergent) than the region at/below it? Returns overall
-    ratio and any per-channel flags where the discarded region diverges
-    MORE than the kept region - candidates for re-examining the cutoff.
+    Quantitative check: is the region ABOVE cutoff_hz (what a bandpass
+    filter with this cutoff would DISCARD) actually quieter/less
+    class-divergent than the region being KEPT? If not, the cutoff may be
+    discarding real signal.
 
     This is a proxy check (average power divergence), not a formal
     significance test - treat borderline results as worth a closer look,
     not as definitive either way.
+
+    Returns:
+        dict with overall_below/overall_above (mean |log_diff| in each
+        region), ratio (above/below - well below 1.0 supports the cutoff;
+        near/above 1.0 suggests re-examining it), flagged_channels
+        (channels where the discarded region diverges MORE than the kept
+        region), and n_channels.
     """
     below_mask = freqs <= cutoff_hz
     above_mask = freqs > cutoff_hz

@@ -1,7 +1,12 @@
 """
-Shared evaluation helpers: classical model fit+eval, and metric computation
-consistent across Path A (classical) and Path B (deep) models so results
-are directly comparable (Notebooks 05 and 06).
+Shared evaluation helpers: classical model fit+eval, and metric
+computation kept consistent across every model family (classical and
+EEGNet) so results are directly comparable regardless of which model_name
+produced them.
+
+No registry here: "how to compute accuracy/precision/recall/F1" isn't a
+pluggable strategy - it's a fixed, standard definition every model's
+results get held to equally.
 """
 
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
@@ -10,13 +15,13 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 
 def compute_classification_metrics(y_true, y_pred, model_name: str, average: str = "binary") -> dict:
     """
-    average: "binary" for Stage 1 (blank vs digit, 2 classes) - matches the
-        roadmap's Stage 1 spec (precision/recall/F1 on the positive class).
-    "macro" for Stage 2 (digit 0-9, 10 classes) - treats every digit class
-        equally regardless of frequency, matching the roadmap's Stage 2 spec
-        ("Macro F1-score"). Passed in by the caller based on cfg.model.stage -
-        this function itself has no knowledge of "stage", only the average
-        mode, keeping it reusable outside this project if needed.
+    average: "binary" for Stage 1 (blank vs digit, 2 classes) - precision/
+        recall/F1 on the positive class.
+        "macro" for Stage 2 (digit 0-9, 10 classes) - treats every digit
+        class equally regardless of frequency. Passed in by the caller
+        based on cfg.model.stage - this function itself has no knowledge
+        of "stage", only the average mode, keeping it reusable outside
+        this project if needed.
     """
     return {
         "model": model_name,
