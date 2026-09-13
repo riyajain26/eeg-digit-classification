@@ -81,11 +81,21 @@ def _ensure_reuse_source_trained(cfg: PipelineConfig, force: bool, run_permutati
           f"resuming {cfg.model.model_name!r}.\n")
 
 
-def run_pipeline(cfg: PipelineConfig, force: bool = False, run_permutation: bool = True) -> dict:
+def run_pipeline(cfg: PipelineConfig, force: bool = False, force_model: bool = False,
+                  run_permutation: bool = True) -> dict:
     """
     Runs every step needed to go from nothing to a trained, evaluated
     model, for whatever cfg.model.task/model_name selects. This is the
     ONE function scripts/run_pipeline.py calls.
+
+    force and force_model are deliberately SEPARATE, not one flag: force
+    re-runs data prep/preprocessing/features too (expensive - full
+    re-acquisition from Hugging Face), while force_model only forces
+    Step 4 to retrain, leaving already-computed data/preprocessing/features
+    alone. Without this split, "I want to retrain this one model" and "I
+    want to redo everything from scratch" would be the same flag, which
+    would make retraining a single model needlessly re-download and
+    re-process the entire dataset first.
 
     Checks outputs from the END backwards, not just forwards: if
     preprocessing's output already exists, data preparation is skipped
@@ -119,7 +129,7 @@ def run_pipeline(cfg: PipelineConfig, force: bool = False, run_permutation: bool
         else:
             print("Pipeline: feature output already present - skipping feature extraction.")
 
-    return run_model_training(cfg, run_permutation=run_permutation)
+    return run_model_training(cfg, run_permutation=run_permutation, force=force or force_model)
 
 
 def prompt_for_variants(cfg: PipelineConfig) -> PipelineConfig:
