@@ -108,6 +108,13 @@ def run_epoch(model, loader, optimizer, criterion, device, train: bool = True,
     LazyEEGDataset). If this stops advancing entirely, the process is
     genuinely stuck (worth interrupting for a traceback); if the batch
     number keeps climbing, it's just slow.
+
+    Each progress line also splits time into data_wait (time spent inside
+    the DataLoader fetching + collating the next batch - dominated by
+    LazyEEGDataset's HDF5 reads when lazy loading is in use) vs.
+    gpu_compute (device transfer + forward + backward + optimizer step) -
+    added specifically to answer "is this slow because of disk I/O or
+    because of the GPU" without needing a separate benchmark.
     """
     model.train() if train else model.eval()
     total_loss, all_preds, all_labels = 0.0, [], []
@@ -115,7 +122,13 @@ def run_epoch(model, loader, optimizer, criterion, device, train: bool = True,
     context = torch.enable_grad() if train else torch.no_grad()
     with context:
         batch_start = time.monotonic()
+        data_wait_total = 0.0
+        compute_total = 0.0
+        fetch_start = time.monotonic()
         for batch_idx, (X_batch, y_batch) in enumerate(loader):
+            data_wait_total += time.monotonic() - fetch_start
+
+            compute_start = time.monotonic()
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
             if train:
@@ -125,6 +138,7 @@ def run_epoch(model, loader, optimizer, criterion, device, train: bool = True,
             if train:
                 loss.backward()
                 optimizer.step()
+            compute_total += time.monotonic() - compute_start
 
             total_loss += loss.item() * X_batch.size(0)
             all_preds.extend(logits.argmax(dim=1).cpu().numpy())
@@ -135,8 +149,13 @@ def run_epoch(model, loader, optimizer, criterion, device, train: bool = True,
                 n_seen = (batch_idx + 1) * loader.batch_size
                 print(f"    {progress_label}batch {batch_idx + 1}/{len(loader)} "
                       f"({min(n_seen, len(loader.dataset))}/{len(loader.dataset)} trials) - "
-                      f"{elapsed:.1f}s since last checkpoint ({progress_every / elapsed:.2f} batches/sec)")
+                      f"{elapsed:.1f}s since last checkpoint ({progress_every / elapsed:.2f} batches/sec) "
+                      f"[data_wait={data_wait_total:.1f}s, gpu_compute={compute_total:.1f}s]")
                 batch_start = time.monotonic()
+                data_wait_total = 0.0
+                compute_total = 0.0
+
+            fetch_start = time.monotonic()
 
     avg_loss = total_loss / len(loader.dataset)
     acc = accuracy_score(all_labels, all_preds)
