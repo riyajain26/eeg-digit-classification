@@ -90,9 +90,45 @@ def _save_results(cfg: PipelineConfig, results: dict) -> None:
     print(f"Results saved to {results_dir / 'results.json'}")
 
 
-def run_classical_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
+def _load_cached_results_if_present(cfg: PipelineConfig, force: bool) -> dict | None:
+    """
+    If a checkpoint AND a results.json already exist for this exact
+    (variant_tag, task, model_name) run, loads and returns the saved
+    results instead of retraining - this is what makes it safe to re-run
+    a notebook cell (or the whole pipeline) without re-training something
+    slow (SVM in particular) that's already done.
+
+    Returns None if force=True, or if either file is missing (a run is
+    only ever considered "done" if BOTH exist - a results.json without a
+    checkpoint, or vice versa, means a previous run was interrupted
+    partway through, so it should be retrained rather than trusted).
+
+    No partial resume: if you want different settings (e.g. run_permutation
+    changed from what was cached), pass force=True to retrain from
+    scratch - same "force re-does everything for this step" contract
+    every other step in this pipeline already uses, not something new.
+    """
+    if force:
+        return None
+    checkpoint_path = cfg.model.checkpoint_path(cfg.data.variant_tag)
+    results_path = cfg.model.results_dir(cfg.data.variant_tag) / "results.json"
+    if not (checkpoint_path.exists() and results_path.exists()):
+        return None
+    print(f"Models [{cfg.model.task}/{cfg.model.model_name}]: checkpoint + results already exist "
+          f"at {results_path} - skipping training, loading cached results (pass force=True to retrain).")
+    with open(results_path) as f:
+        return json.load(f)
+
+
+def run_classical_model(cfg: PipelineConfig, run_permutation: bool = True, force: bool = False) -> dict:
     """Trains + evaluates a classical model (LDA/SVM/RandomForest) end to
-    end: load features, scale, fit, evaluate, checkpoint, permutation test."""
+    end: load features, scale, fit, evaluate, checkpoint, permutation test.
+    Skips entirely (loading cached results instead) if already done - see
+    _load_cached_results_if_present."""
+    cached = _load_cached_results_if_present(cfg, force)
+    if cached is not None:
+        return cached
+
     X_train, y_train, X_val, y_val, average = _load_classical_features(cfg)
 
     scaler = StandardScaler()
@@ -148,12 +184,17 @@ def run_classical_model(cfg: PipelineConfig, run_permutation: bool = True) -> di
     return results
 
 
-def run_deep_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
+def run_deep_model(cfg: PipelineConfig, run_permutation: bool = True, force: bool = False) -> dict:
     """Trains + evaluates any EEGNet variant (for either task) end to end:
     lazy-load indices, train (single-phase, or eegnet_finetuned_backbone_reuse's
-    two-phase), evaluate, permutation test. Requires PyTorch - imported
-    here (not at module level) so classical-only usage of this file never
-    needs it installed."""
+    two-phase), evaluate, permutation test. Skips entirely (loading cached
+    results instead) if already done - see _load_cached_results_if_present.
+    Requires PyTorch - imported here (not at module level) so classical-only
+    usage of this file never needs it installed."""
+    cached = _load_cached_results_if_present(cfg, force)
+    if cached is not None:
+        return cached
+
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
@@ -288,7 +329,7 @@ def run_deep_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
     return results
 
 
-def run_model_training(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
+def run_model_training(cfg: PipelineConfig, run_permutation: bool = True, force: bool = False) -> dict:
     """
     Full Step 4 entry point: trains + evaluates whichever model
     cfg.model.model_name names, branching to the classical or deep path.
@@ -298,7 +339,11 @@ def run_model_training(cfg: PipelineConfig, run_permutation: bool = True) -> dic
     backbone-reuse model additionally requires a trained eegnet_fresh
     checkpoint for cfg.model.eegnet.reuse_source_task to already exist
     (see src/models/factory.py's _load_reuse_source_backbone).
+
+    force=False (the default) skips training entirely and returns cached
+    results if this exact (variant_tag, task, model_name) has already been
+    run - see _load_cached_results_if_present.
     """
     if cfg.model.is_deep:
-        return run_deep_model(cfg, run_permutation=run_permutation)
-    return run_classical_model(cfg, run_permutation=run_permutation)
+        return run_deep_model(cfg, run_permutation=run_permutation, force=force)
+    return run_classical_model(cfg, run_permutation=run_permutation, force=force)

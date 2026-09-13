@@ -36,6 +36,8 @@ def main() -> None:
                               "which task's trained eegnet_fresh checkpoint to reuse.")
     parser.add_argument("--no-permutation", action="store_true",
                          help="Skip the permutation (shuffled-label) test - useful for a quick run.")
+    parser.add_argument("--force", action="store_true",
+                         help="Retrain even if a checkpoint + results.json already exist for this run.")
     args = parser.parse_args()
 
     cfg = build_config(
@@ -48,9 +50,9 @@ def main() -> None:
     cfg.model.eegnet.reuse_source_task = args.reuse_source_task
 
     print(f"=== Step 4: models === model={args.model_name!r} task={args.task!r} "
-          f"run_permutation={not args.no_permutation}")
+          f"run_permutation={not args.no_permutation} force={args.force}")
 
-    results = run_model_training(cfg, run_permutation=not args.no_permutation)
+    results = run_model_training(cfg, run_permutation=not args.no_permutation, force=args.force)
     print("\n=== Final results ===")
     print(results["metrics"])
     if results.get("permutation_test"):

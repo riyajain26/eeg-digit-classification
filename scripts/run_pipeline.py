@@ -38,7 +38,10 @@ def main() -> None:
                          help="Prompt for each pluggable step's variant at the terminal.")
     parser.add_argument("--no-permutation", action="store_true")
     parser.add_argument("--force", action="store_true",
-                         help="Re-run every step even if outputs already exist.")
+                         help="Re-run EVERY step, including data acquisition, even if outputs exist.")
+    parser.add_argument("--force-model", action="store_true",
+                         help="Retrain just the model even if a checkpoint+results already exist, "
+                              "WITHOUT re-running data prep/preprocessing/features.")
     args = parser.parse_args()
 
     cfg = build_config(
@@ -60,7 +63,8 @@ def main() -> None:
     print(f"=== Full pipeline === task={cfg.model.task!r} model={cfg.model.model_name!r} "
           f"dataset={cfg.data.variant_tag!r} run_permutation={not args.no_permutation}")
 
-    results = run_pipeline(cfg, force=args.force, run_permutation=not args.no_permutation)
+    results = run_pipeline(cfg, force=args.force, force_model=args.force_model,
+                            run_permutation=not args.no_permutation)
 
     print("\n=== Pipeline complete ===")
     print(results["metrics"])
