@@ -13,6 +13,7 @@ independent choice - see train_with_two_phase_finetuning below).
 """
 
 from pathlib import Path
+import time
 
 import h5py
 import numpy as np
@@ -95,13 +96,26 @@ def make_lazy_loaders(train_h5_path, train_indices, y_train, val_h5_path, val_in
     return train_loader, val_loader
 
 
-def run_epoch(model, loader, optimizer, criterion, device, train: bool = True):
+def run_epoch(model, loader, optimizer, criterion, device, train: bool = True,
+              progress_every: int = 20, progress_label: str = ""):
+    """
+    progress_every: print a timing line every this many batches (0 disables
+    it). Added specifically so a slow-but-progressing epoch is visibly
+    distinguishable from a truly frozen one - the per-epoch summary print
+    in train_with_checkpointing only fires once the WHOLE epoch finishes,
+    which looks identical to a hang if a single epoch takes a long time
+    (e.g. many trials x per-trial random-access HDF5 reads via
+    LazyEEGDataset). If this stops advancing entirely, the process is
+    genuinely stuck (worth interrupting for a traceback); if the batch
+    number keeps climbing, it's just slow.
+    """
     model.train() if train else model.eval()
     total_loss, all_preds, all_labels = 0.0, [], []
 
     context = torch.enable_grad() if train else torch.no_grad()
     with context:
-        for X_batch, y_batch in loader:
+        batch_start = time.monotonic()
+        for batch_idx, (X_batch, y_batch) in enumerate(loader):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
             if train:
@@ -115,6 +129,14 @@ def run_epoch(model, loader, optimizer, criterion, device, train: bool = True):
             total_loss += loss.item() * X_batch.size(0)
             all_preds.extend(logits.argmax(dim=1).cpu().numpy())
             all_labels.extend(y_batch.cpu().numpy())
+
+            if progress_every and (batch_idx + 1) % progress_every == 0:
+                elapsed = time.monotonic() - batch_start
+                n_seen = (batch_idx + 1) * loader.batch_size
+                print(f"    {progress_label}batch {batch_idx + 1}/{len(loader)} "
+                      f"({min(n_seen, len(loader.dataset))}/{len(loader.dataset)} trials) - "
+                      f"{elapsed:.1f}s since last checkpoint ({progress_every / elapsed:.2f} batches/sec)")
+                batch_start = time.monotonic()
 
     avg_loss = total_loss / len(loader.dataset)
     acc = accuracy_score(all_labels, all_preds)
@@ -155,8 +177,10 @@ def train_with_checkpointing(
     epochs_without_improvement = 0
 
     for epoch in range(n_epochs):
-        train_loss, train_acc = run_epoch(model, train_loader, optimizer, criterion, device, train=True)
-        val_loss, val_acc = run_epoch(model, val_loader, optimizer, criterion, device, train=False)
+        train_loss, train_acc = run_epoch(model, train_loader, optimizer, criterion, device,
+                                           train=True, progress_label="train ")
+        val_loss, val_acc = run_epoch(model, val_loader, optimizer, criterion, device,
+                                       train=False, progress_label="val ")
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)

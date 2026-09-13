@@ -251,7 +251,7 @@ def run_deep_model(cfg: PipelineConfig, run_permutation: bool = True) -> dict:
             crit = nn.CrossEntropyLoss()
             loader = DataLoader(EEGDataset(eeg_sub, y_sub), batch_size=cfg.training.batch_size, shuffle=True)
             for _ in range(cfg.permutation.deep_quick_epochs):
-                run_epoch(m, loader, opt, crit, device, train=True)
+                run_epoch(m, loader, opt, crit, device, train=True, progress_every=0)  # quiet - this runs many times during permutation testing
             return m
 
         def eval_fn(m, loader):
