@@ -347,3 +347,90 @@ def run_model_training(cfg: PipelineConfig, run_permutation: bool = True, force:
     if cfg.model.is_deep:
         return run_deep_model(cfg, run_permutation=run_permutation, force=force)
     return run_classical_model(cfg, run_permutation=run_permutation, force=force)
+
+
+def run_full_budget_shuffled_label_check(cfg: PipelineConfig, seed_offset: int = 0) -> dict:
+    """
+    Full-budget permutation diagnostic for deep (EEGNet) models: trains
+    cfg.model.model_name on cfg.model.task with TRAINING labels shuffled,
+    using the EXACT SAME training budget as a real run (same cfg.training
+    settings - n_epochs, batch_size, learning_rate, early_stop_patience -
+    and the full training set, not a subsample).
+
+    This is deliberately different from run_deep_model's built-in
+    permutation_test, which is a fast approximation (small subsample, few
+    quick epochs) - fine as a routine sanity check, but not sensitive
+    enough to rule out a REAL but WEAK signal, or leakage that only shows
+    up with the full training budget. This function answers "would this
+    exact amount of training, on this exact amount of data, produce
+    similar accuracy on completely fake labels?" - if yes, the real run's
+    accuracy is not trustworthy evidence of genuine digit signal.
+
+    Evaluates on the REAL (unshuffled) validation labels - only the
+    TRAINING labels are shuffled. A model with no real signal to exploit
+    should land near chance on val even after full training on shuffled
+    labels; landing close to the real run's val accuracy instead points
+    at leakage (e.g. session-level structure correlating with labels for
+    reasons unrelated to genuine digit content).
+
+    Does NOT touch cfg.model.checkpoint_path()/results_dir() - those are
+    the real run's cache, checked by _load_cached_results_if_present.
+    Writing there would risk this diagnostic being loaded back as if it
+    were a real result, or overwriting one. Output goes to a clearly
+    separate shuffled_label_checks/ subfolder instead.
+
+    seed_offset: added to cfg.seed for this call's shuffle + model init,
+    so calling this 2-3 times with different offsets gives independent
+    shuffle draws rather than relying on a single one.
+    """
+    import torch
+
+    from src.training.loop import make_lazy_loaders, train_with_checkpointing
+
+    if not cfg.model.is_deep:
+        raise ValueError("run_full_budget_shuffled_label_check only supports deep (EEGNet) models - "
+                          f"got model_name={cfg.model.model_name!r}.")
+
+    shuffle_seed = cfg.seed + seed_offset
+    train_h5_path, train_indices, y_train, val_h5_path, val_indices, y_val = _load_deep_lazy_indices(cfg)
+
+    rng = np.random.default_rng(shuffle_seed)
+    y_train_shuffled = rng.permutation(y_train)   # TRAIN labels only - val stays real/unshuffled
+
+    with h5py.File(train_h5_path, "r") as f:
+        n_channels, n_samples = f["eeg"].shape[1], f["eeg"].shape[2]
+    n_classes = cfg.model.n_classes
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Full-budget shuffled-label check [{cfg.model.task}/{cfg.model.model_name}] "
+          f"seed_offset={seed_offset} (shuffle_seed={shuffle_seed}): device={device}, "
+          f"train={len(train_indices)}, val={len(val_indices)} trials, n_epochs={cfg.training.n_epochs}")
+    torch.manual_seed(shuffle_seed)
+
+    train_loader, val_loader = make_lazy_loaders(train_h5_path, train_indices, y_train_shuffled,
+                                                   val_h5_path, val_indices, y_val, cfg.training.batch_size)
+
+    builder = MODEL_REGISTRY.get(cfg.model.model_name)
+    model = builder.build(cfg, n_channels, n_samples, n_classes).to(device)
+
+    diag_dir = cfg.model.results_dir(cfg.data.variant_tag) / "shuffled_label_checks"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = diag_dir / f"shuffled_seed{shuffle_seed}.pt"
+
+    history = train_with_checkpointing(
+        model, train_loader, val_loader, checkpoint_path, device,
+        cfg.training.n_epochs, cfg.training.learning_rate, cfg.training.early_stop_patience,
+    )
+
+    result = {
+        "task": cfg.model.task,
+        "model": cfg.model.model_name,
+        "n_epochs": cfg.training.n_epochs,
+        "shuffle_seed": shuffle_seed,
+        "best_val_acc_on_shuffled_train_labels": history["best_val_acc"],
+    }
+    with open(diag_dir / f"shuffled_seed{shuffle_seed}_result.json", "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Full-budget shuffled-label check result: {result}")
+
+    return result
